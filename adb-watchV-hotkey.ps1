@@ -1,7 +1,8 @@
 ﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
-    交互式连接设备，然后监听 Shift+↑ / Shift+↓，向 adb 设备发送"上滑 / 下滑"手势。
+    交互式连接设备，然后监听 Shift+↑ / Shift+↓ / Shift+空格，
+    向 adb 设备发送「上滑 / 下滑 / 屏幕正中点按」手势。
 
 .DESCRIPTION
     启动后的交互流程：
@@ -17,12 +18,13 @@
           IP 输入框预填了 "192.168"（内网基本都是这个开头），接着往下敲就行。
 
       [3] 连上之后才开始监听键盘：
-          Shift + ↑   上滑（手指从屏幕下方划到上方 -> 内容往上滚）
-          Shift + ↓   下滑（手指从屏幕上方划到下方 -> 内容往下滚）
+          Shift + ↑     上滑（手指从屏幕下方划到上方 -> 内容往上滚）
+          Shift + ↓     下滑（手指从屏幕上方划到下方 -> 内容往下滚）
+          Shift + 空格  点按屏幕正中（相当于在屏幕中央轻点一下）
           按住不放会连续滑动（一次滑动做完就补发下一次）。
 
-          每次滑动【不新增任何输出行】：只把输出最后那一行的计数改写一遍
-          （上滑 / 下滑次数原地刷新），所以滑多少次屏幕都不会被刷满。
+          每次动作【不新增任何输出行】：只把输出最后那一行的计数改写一遍
+          （上滑 / 下滑 / 点按 次数原地刷新），所以按多少次屏幕都不会被刷满。
           Ctrl+C 或关窗口停止时，再给一行合计。
 
     配对成功后的设备地址会存进脚本同目录的 adb-watchV.config.json，
@@ -30,8 +32,8 @@
     配对码是一次性的，不会落盘。
 
     默认是【全局热键】：脚本窗口不在前台也照样触发，方便你盯着手机屏幕操作。
-    代价是脚本运行期间，Shift+↑ / Shift+↓ 在整个系统都被本脚本吃掉
-    （包括文本编辑器里的"选中到行首/行尾"这种操作）。
+    代价是脚本运行期间，Shift+↑ / Shift+↓ / Shift+空格 在整个系统都被本脚本吃掉
+    （包括文本编辑器里的「选中到行首/行尾」，以及中文输入法的全角/半角切换）。
     不想影响其它软件就加 -ConsoleOnly：只在这个控制台窗口有焦点时生效。
 
     停止监听：关掉窗口，或者按 Ctrl+C。
@@ -70,7 +72,7 @@ param(
     [ValidateRange(0.05, 0.95)]
     [double]$FarRatio = 0.2,
 
-    # 只监听本控制台窗口，不抢系统的 Shift+↑ / Shift+↓
+    # 只监听本控制台窗口，不抢系统的 Shift+↑ / Shift+↓ / Shift+空格
     [switch]$ConsoleOnly
 )
 
@@ -853,6 +855,7 @@ $H = [int]$Matches[2]
 $X     = [int][math]::Floor($W / 2)          # 竖直中线
 $Ynear = [int][math]::Floor($H * $NearRatio) # 屏幕靠下
 $Yfar  = [int][math]::Floor($H * $FarRatio)  # 屏幕靠上
+$Ymid  = [int][math]::Floor($H / 2)          # 屏幕正中（点按用）
 
 
 # ---------------------------------------------------------------- 3. 滑动动作
@@ -860,11 +863,7 @@ $Yfar  = [int][math]::Floor($H * $FarRatio)  # 屏幕靠上
 # 计数：只活在本次会话里，关掉窗口就清零
 $script:SwipeUp   = 0
 $script:SwipeDown = 0
-$script:SwipeFail = 0
-
-# 计数：只活在本次会话里，关掉窗口就清零
-$script:SwipeUp   = 0
-$script:SwipeDown = 0
+$script:TapCount  = 0
 $script:SwipeFail = 0
 $script:StatsRow  = -1        # 统计行所在的缓冲行号；-1 = 还没画过
 
@@ -877,7 +876,7 @@ $script:StatsRow  = -1        # 统计行所在的缓冲行号；-1 = 还没画�
    刷新 = 把光标挪回去覆盖重写，再挪回原处（不换行，所以不占新行）。
    要打印别的内容时，先把它擦掉、让出这一行，打完再贴回最后一行。 #>
 function Get-StatsText {
-    $t = "adb-watchV  |  上滑 $script:SwipeUp   下滑 $script:SwipeDown"
+    $t = "adb-watchV  |  上滑 $script:SwipeUp   下滑 $script:SwipeDown   点按 $script:TapCount"
     if ($script:SwipeFail -gt 0) { $t += "   失败 $script:SwipeFail" }
     return $t
 }
@@ -929,7 +928,7 @@ function Reset-StatsLine {
 function Write-StatsSummary {
     Reset-StatsLine
     $total = $script:SwipeUp + $script:SwipeDown
-    $line  = "本次共滑动 $total 次（上滑 $script:SwipeUp / 下滑 $script:SwipeDown）"
+    $line  = "本次共滑动 $total 次（上滑 $script:SwipeUp / 下滑 $script:SwipeDown），点按 $script:TapCount 次"
     if ($script:SwipeFail -gt 0) { $line += "，失败 $script:SwipeFail 次" }
     Write-Stamp $line Cyan
 }
@@ -967,6 +966,27 @@ function Invoke-Swipe {
     Show-Stats
 }
 
+<# 在屏幕正中点一下。
+   和滑动同一套规矩：成功时【零输出】，只把最后那行的计数改写一遍；
+   只有失败才吭一声（打印前先让出统计行，打完再贴回最后一行）。 #>
+function Invoke-Tap {
+    $arguments = @('-s', $Device, 'shell', 'input', 'tap', "$X", "$Ymid")
+    $stdout    = Invoke-Adb $arguments
+    $code      = $LASTEXITCODE
+
+    if ($code -ne 0) {
+        $script:SwipeFail = $script:SwipeFail + 1
+        Reset-StatsLine
+        Write-Stamp "· 点按失败（adb 返回 $code）" Yellow
+        Write-AdbRaw -Arguments $arguments -StdOut $stdout -ExitCode $code
+        Show-Stats
+        return
+    }
+
+    $script:TapCount = $script:TapCount + 1
+    Show-Stats
+}
+
 
 # ---------------------------------------------------------------- 4. 打印一下配置
 Write-Host ""
@@ -977,6 +997,7 @@ Write-Host "设备    : $Device"
 Write-Host "分辨率  : ${W}x${H}"
 Write-Host "上滑    : ($X, $Ynear) -> ($X, $Yfar)  ${Duration}ms"
 Write-Host "下滑    : ($X, $Yfar)  -> ($X, $Ynear)  ${Duration}ms"
+Write-Host "点按    : ($X, $Ymid)"
 Write-Host ""
 
 
@@ -993,6 +1014,7 @@ public static class HotKeyNative
     public const uint MOD_SHIFT    = 0x0004;
     public const uint VK_UP        = 0x26;
     public const uint VK_DOWN      = 0x28;
+    public const uint VK_SPACE     = 0x20;
     private const uint PM_REMOVE   = 0x0001;
 
     [StructLayout(LayoutKind.Sequential)]
@@ -1055,18 +1077,21 @@ public static class HotKeyNative
 
     $idUp   = 1
     $idDown = 2
+    $idTap  = 3
 
     $okUp   = [HotKeyNative]::RegisterShiftHotKey($idUp,   [HotKeyNative]::VK_UP)
     $okDown = [HotKeyNative]::RegisterShiftHotKey($idDown, [HotKeyNative]::VK_DOWN)
+    $okTap  = [HotKeyNative]::RegisterShiftHotKey($idTap,  [HotKeyNative]::VK_SPACE)
 
     if (-not $okUp)   { Write-Stamp "Shift+↑ 注册失败（可能被别的程序占着）" Yellow }
     if (-not $okDown) { Write-Stamp "Shift+↓ 注册失败（可能被别的程序占着）" Yellow }
-    if (-not $okUp -and -not $okDown) {
-        Write-Host "两个热键都没注册上，监听没意义，退出。" -ForegroundColor Red
+    if (-not $okTap)  { Write-Stamp "Shift+空格 注册失败（多半是中文输入法占着全角/半角切换）" Yellow }
+    if (-not $okUp -and -not $okDown -and -not $okTap) {
+        Write-Host "三个热键都没注册上，监听没意义，退出。" -ForegroundColor Red
         exit 1
     }
 
-    Write-Host "正在(全局)监听 Shift+↑ / Shift+↓ ... 关窗口或 Ctrl+C 停止" -ForegroundColor Green
+    Write-Host "正在(全局)监听 Shift+↑ 上滑 / Shift+↓ 下滑 / Shift+空格 点按 ... 关窗口或 Ctrl+C 停止" -ForegroundColor Green
     Show-Stats                      # 先把统计行立起来（0 / 0）
 
     try {
@@ -1075,6 +1100,7 @@ public static class HotKeyNative
             if ([HotKeyNative]::TryGetHotKeyId([ref]$hotKeyId)) {
                 if     ($hotKeyId -eq $idUp)   { Invoke-Swipe -Direction Up }
                 elseif ($hotKeyId -eq $idDown) { Invoke-Swipe -Direction Down }
+                elseif ($hotKeyId -eq $idTap)  { Invoke-Tap }
 
                 [HotKeyNative]::DrainHotKeys()
             } else {
@@ -1084,6 +1110,7 @@ public static class HotKeyNative
     } finally {
         if ($okUp)   { [HotKeyNative]::UnregisterHotKeyById($idUp) }
         if ($okDown) { [HotKeyNative]::UnregisterHotKeyById($idDown) }
+        if ($okTap)  { [HotKeyNative]::UnregisterHotKeyById($idTap) }
         Reset-StatsLine             # 让出统计行，后面的消息按正常顺序继续往下打
         Write-Host ""
         Write-Stamp "已停止监听，热键已释放。" Cyan
@@ -1093,7 +1120,7 @@ public static class HotKeyNative
 # ================================================================ 模式 B：只监听本窗口
 else {
 
-    Write-Host "正在(本窗口)监听 Shift+↑ / Shift+↓ ... 保持窗口为当前焦点，Ctrl+C 停止" -ForegroundColor Green
+    Write-Host "正在(本窗口)监听 Shift+↑ 上滑 / Shift+↓ 下滑 / Shift+空格 点按 ... 保持窗口为当前焦点，Ctrl+C 停止" -ForegroundColor Green
     Show-Stats                      # 先把统计行立起来（0 / 0）
 
     try {
@@ -1104,6 +1131,7 @@ else {
 
             if     ($key.Key -eq [ConsoleKey]::UpArrow)   { Invoke-Swipe -Direction Up }
             elseif ($key.Key -eq [ConsoleKey]::DownArrow) { Invoke-Swipe -Direction Down }
+            elseif ($key.Key -eq [ConsoleKey]::Spacebar)  { Invoke-Tap }
         }
     } finally {
         Reset-StatsLine

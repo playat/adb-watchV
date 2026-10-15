@@ -21,8 +21,8 @@
           Shift + ↓   下滑（手指从屏幕上方划到下方 -> 内容往下滚）
           按住不放会连续滑动（一次滑动做完就补发下一次）。
 
-          每次滑动【默默执行、不打印】—— input swipe 成功时本来就没有输出。
-          累计次数实时显示在窗口标题栏（上滑 / 下滑），
+          每次滑动【不新增任何输出行】：只把输出最后那一行的计数改写一遍
+          （上滑 / 下滑次数原地刷新），所以滑多少次屏幕都不会被刷满。
           Ctrl+C 或关窗口停止时，再给一行合计。
 
     配对成功后的设备地址会存进脚本同目录的 adb-watchV.config.json，
@@ -862,17 +862,72 @@ $script:SwipeUp   = 0
 $script:SwipeDown = 0
 $script:SwipeFail = 0
 
-<# 把计数写进窗口标题栏。
-   之所以挑标题栏而不是控制台里再印一行：滑一次印一行，屏幕很快就被刷满，
-   真正有用的信息全被顶走了。标题栏位置固定、不占正文、任何终端都支持。 #>
-function Update-StatsTitle {
-    $title = "adb-watchV  |  上滑 $script:SwipeUp   下滑 $script:SwipeDown"
-    if ($script:SwipeFail -gt 0) { $title += "   失败 $script:SwipeFail" }
-    try { $Host.UI.RawUI.WindowTitle = $title } catch { }
+# 计数：只活在本次会话里，关掉窗口就清零
+$script:SwipeUp   = 0
+$script:SwipeDown = 0
+$script:SwipeFail = 0
+$script:StatsRow  = -1        # 统计行所在的缓冲行号；-1 = 还没画过
+
+<# --------------------------------------------------------- 统计行
+
+   计数固定在【输出的最后一行】，每滑一次原地重画这一行 ——
+   不新增任何输出行，屏幕刷不满，统计还一直趴在眼皮底下。
+
+   原理：用 $script:StatsRow 记住那一行在缓冲区里的行号。
+   刷新 = 把光标挪回去覆盖重写，再挪回原处（不换行，所以不占新行）。
+   要打印别的内容时，先把它擦掉、让出这一行，打完再贴回最后一行。 #>
+function Get-StatsText {
+    $t = "adb-watchV  |  上滑 $script:SwipeUp   下滑 $script:SwipeDown"
+    if ($script:SwipeFail -gt 0) { $t += "   失败 $script:SwipeFail" }
+    return $t
 }
 
-<# 收尾汇总，退出时打一行 #>
+function Get-ConsoleWidth {
+    try {
+        $w = [Console]::WindowWidth
+        if ($w -gt 1) { return ($w - 1) }
+    } catch { }
+    return 79
+}
+
+<# 原地重画统计行 #>
+function Show-Stats {
+    $line = (Get-StatsText).PadRight((Get-ConsoleWidth))
+    try {
+        if ($script:StatsRow -lt 0) {
+            # 第一次：占下当前行，但【不换行】—— 让统计行本身就是最后一行，
+            # 底下不留空行，光标就停在它上面。
+            if ([Console]::CursorLeft -ne 0) { [Console]::WriteLine() }
+            $row = [Console]::CursorTop
+            [Console]::Write($line)
+            $script:StatsRow = $row
+        } else {
+            $saved = [Console]::CursorTop
+            [Console]::SetCursorPosition(0, $script:StatsRow)
+            [Console]::Write($line)                      # Write 不换行，才不会多占行
+            [Console]::SetCursorPosition(0, $saved)
+        }
+    } catch {
+        # 不是真实控制台（被重定向 / 宿主不支持光标定位）就退化成普通输出
+        Write-Host (Get-StatsText) -ForegroundColor DarkGray
+    }
+}
+
+<# 让出统计行：擦干净、光标停在行首，并把这一行交还给下一条输出。
+   调用之后正常打印，内容就落在这里，统计行则被挤到最后一行重新画。 #>
+function Reset-StatsLine {
+    if ($script:StatsRow -lt 0) { return }
+    try {
+        [Console]::SetCursorPosition(0, $script:StatsRow)
+        [Console]::Write((' ' * (Get-ConsoleWidth)))
+        [Console]::SetCursorPosition(0, $script:StatsRow)
+    } catch { }
+    $script:StatsRow = -1
+}
+
+<# 收尾汇总：先让出统计行，再打一行合计（合计本身已含上滑/下滑次数） #>
 function Write-StatsSummary {
+    Reset-StatsLine
     $total = $script:SwipeUp + $script:SwipeDown
     $line  = "本次共滑动 $total 次（上滑 $script:SwipeUp / 下滑 $script:SwipeDown）"
     if ($script:SwipeFail -gt 0) { $line += "，失败 $script:SwipeFail 次" }
@@ -880,8 +935,8 @@ function Write-StatsSummary {
 }
 
 <# 一次滑动。
-   成功时【完全安静】—— input swipe 成功本来就不吐任何东西，静默才是正常，
-   计数悄悄加在标题栏上。只有失败才吭一声，免得错误被无声吞掉。 #>
+   成功时【不新增任何输出行】—— 只把最后那一行的计数改写一遍。
+   只有失败才吭一声：打印前先让出统计行，打完再把统计行贴回最后一行。 #>
 function Invoke-Swipe {
     param([ValidateSet('Up', 'Down')][string]$Direction)
 
@@ -897,9 +952,10 @@ function Invoke-Swipe {
 
     if ($code -ne 0) {
         $script:SwipeFail = $script:SwipeFail + 1
-        Update-StatsTitle
+        Reset-StatsLine
         Write-Stamp "$arrow 滑动失败（adb 返回 $code）" Yellow
         Write-AdbRaw -Arguments $arguments -StdOut $stdout -ExitCode $code
+        Show-Stats
         return
     }
 
@@ -908,7 +964,7 @@ function Invoke-Swipe {
     } else {
         $script:SwipeDown = $script:SwipeDown + 1
     }
-    Update-StatsTitle
+    Show-Stats
 }
 
 
@@ -1011,7 +1067,7 @@ public static class HotKeyNative
     }
 
     Write-Host "正在(全局)监听 Shift+↑ / Shift+↓ ... 关窗口或 Ctrl+C 停止" -ForegroundColor Green
-    Write-Stamp "计数在窗口标题栏，退出时给汇总。" DarkGray
+    Show-Stats                      # 先把统计行立起来（0 / 0）
 
     try {
         while ($true) {
@@ -1028,6 +1084,7 @@ public static class HotKeyNative
     } finally {
         if ($okUp)   { [HotKeyNative]::UnregisterHotKeyById($idUp) }
         if ($okDown) { [HotKeyNative]::UnregisterHotKeyById($idDown) }
+        Reset-StatsLine             # 让出统计行，后面的消息按正常顺序继续往下打
         Write-Host ""
         Write-Stamp "已停止监听，热键已释放。" Cyan
         Write-StatsSummary
@@ -1037,7 +1094,7 @@ public static class HotKeyNative
 else {
 
     Write-Host "正在(本窗口)监听 Shift+↑ / Shift+↓ ... 保持窗口为当前焦点，Ctrl+C 停止" -ForegroundColor Green
-    Write-Stamp "计数在窗口标题栏，退出时给汇总。" DarkGray
+    Show-Stats                      # 先把统计行立起来（0 / 0）
 
     try {
         while ($true) {
@@ -1049,6 +1106,7 @@ else {
             elseif ($key.Key -eq [ConsoleKey]::DownArrow) { Invoke-Swipe -Direction Down }
         }
     } finally {
+        Reset-StatsLine
         Write-Host ""
         Write-Stamp "已停止监听。" Cyan
         Write-StatsSummary

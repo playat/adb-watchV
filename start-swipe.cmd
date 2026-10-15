@@ -1,6 +1,6 @@
 @echo off
 setlocal
-title adb swipe hotkey
+title adb watchV hotkey
 
 rem =====================================================================
 rem  Double-click this file to start the Shift+Up / Shift+Down swiper.
@@ -17,15 +17,15 @@ rem  Needs a real console window (arrow keys + typed input), so run it
 rem  by double-clicking, not by piping it into something.
 rem
 rem  Optional arguments (run from a console, e.g.):
-rem     start-swipe.cmd -Setup                  skip the menu, go to connect attempts
-rem     start-swipe.cmd -Device 192.168.1.100:5555
-rem     start-swipe.cmd -ConsoleOnly            only listen while focused
+rem     start-watchV.cmd -Setup                  skip the menu, go to connect attempts
+rem     start-watchV.cmd -Device 192.168.1.100:5555
+rem     start-watchV.cmd -ConsoleOnly            only listen while focused
 rem =====================================================================
 
-set "SCRIPT=%~dp0adb-swipe-hotkey.ps1"
+set "SCRIPT=%~dp0adb-watchV-hotkey.ps1"
 
 if not exist "%SCRIPT%" (
-    echo [ERROR] adb-swipe-hotkey.ps1 not found next to this launcher.
+    echo [ERROR] adb-watchV-hotkey.ps1 not found next to this launcher.
     echo         Both files must sit in the same folder.
     pause
     exit /b 1

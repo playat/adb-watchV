@@ -21,7 +21,7 @@
           Shift + ↓   下滑（手指从屏幕上方划到下方 -> 内容往下滚）
           按住不放会连续滑动（一次滑动做完就补发下一次）。
 
-    配对成功后的设备地址会存进脚本同目录的 adb-swipe.config.json，
+    配对成功后的设备地址会存进脚本同目录的 adb-watchV.config.json，
     下次启动它会成为菜单里的默认项（直接回车即用）。
     配对码是一次性的，不会落盘。
 
@@ -39,13 +39,13 @@
     都找不到才会退回宿主机 PATH 里的 adb，并给一句黄色提醒。
 
 .EXAMPLE
-    .\start-swipe.cmd                       # 双击这个，最省事
+    .\start-watchV.cmd                       # 双击这个，最省事
 .EXAMPLE
-    .\start-swipe.cmd -Setup                # 跳过设备菜单，直接进连接新设备流程
+    .\start-watchV.cmd -Setup                # 跳过设备菜单，直接进连接新设备流程
 .EXAMPLE
-    .\start-swipe.cmd -Device 192.168.1.100:5555 -Duration 250
+    .\start-watchV.cmd -Device 192.168.1.100:5555 -Duration 250
 .EXAMPLE
-    .\start-swipe.cmd -ConsoleOnly          # 只监听本窗口，不抢系统热键
+    .\start-watchV.cmd -ConsoleOnly          # 只监听本窗口，不抢系统热键
 #>
 [CmdletBinding()]
 param(
@@ -198,7 +198,7 @@ function Write-AdbRaw {
 function Get-ConfigPath {
     $dir = $PSScriptRoot
     if (-not $dir) { $dir = (Get-Location).Path }
-    Join-Path $dir 'adb-swipe.config.json'
+    Join-Path $dir 'adb-watchV.config.json'
 }
 
 function Read-Config {
@@ -563,7 +563,7 @@ function Try-Connect {
 function Connect-NewDevice {
 
     if (-not (Test-Interactive)) {
-        Write-Host "连接流程需要交互式终端。请用 -Device 指定设备，或双击 start-swipe.cmd。" -ForegroundColor Red
+        Write-Host "连接流程需要交互式终端。请用 -Device 指定设备，或双击 start-watchV.cmd。" -ForegroundColor Red
         return ''
     }
 

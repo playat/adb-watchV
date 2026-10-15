@@ -1,4 +1,4 @@
-# adb-swipe
+# adb-watchV
 
 用键盘的 `Shift+↑` / `Shift+↓`，给安卓手机发上滑 / 下滑手势。
 
@@ -7,11 +7,29 @@
 
 ---
 
+## 真实使用场景：工位、耳机、最暗的屏幕
+
+先说人话，这东西到底是给谁写的。
+
+设想一下这个画面。你在工位上，手机搁在桌角，屏幕亮度已经拉到最低 —— 低到隔壁工位瞟一眼，只看见一块快熄灭的黑玻璃。耳机塞着，屏幕里在播视频，但你压根没在看，你在听。
+
+然后视频播完了，得滑下一条。
+
+于是你伸手去够手机：屏幕"啪"地亮起来，指尖点一下、划一下，屏幕再暗回去。整套动作不到两秒，但**它亮了**。在工位上，一块突然亮起的屏幕比什么都显眼，比屏保还高调 —— 那一下闪光，基本等于举手发言。
+
+现在换个方式：手摆在键盘上不动，敲一下 `Shift+↓`，手机自己滑到下一条。屏幕全程是黑的，耳机继续响着，而你的姿势从第一秒到最后一秒都只有一个含义 —— 「正在认真工作」。
+
+> 摸鱼的最高境界，是不产生任何一个多余的动作。
+
+（同理适用于：开会时桌子底下刷小说、床上听相声、开车等红灯……最后一个当我没说。）
+
+---
+
 ## 快速开始
 
 1. 手机：`设置 > 关于手机 > 连点 7 次「版本号」` 打开开发者选项
 2. 手机：`设置 > 开发者选项 > 无线调试` 打开
-3. 电脑：双击 `start-swipe.cmd`
+3. 电脑：双击 `start-watchV.cmd`
 4. 跟着提示选设备 / 输地址，连上后就能按 `Shift+↑` `Shift+↓` 了
 
 关掉窗口（或 `Ctrl+C`）即停止，热键自动释放，不留后台进程。
@@ -21,10 +39,10 @@
 ## 目录结构
 
 ```
-adb-swipe\
-├── start-swipe.cmd            ← 双击这个
-├── adb-swipe-hotkey.ps1       主脚本，真正干活的
-├── adb-swipe.config.json      记住上次用过的设备（自动生成）
+adb-watchV\
+├── start-watchV.cmd           ← 双击这个
+├── adb-watchV-hotkey.ps1      主脚本，真正干活的
+├── adb-watchV.config.json     记住上次用过的设备（自动生成）
 └── adb\
     ├── adb.exe                 自带的 adb，不依赖系统环境变量
     ├── AdbWinApi.dll
@@ -102,10 +120,10 @@ adb 里检测到 2 台可用设备，请选择：
 双击启动时传不了参数。想用参数就在控制台里跑：
 
 ```bat
-start-swipe.cmd -Setup
-start-swipe.cmd -Device 192.168.88.22:43921
-start-swipe.cmd -ConsoleOnly
-start-swipe.cmd -Device 192.168.88.22:43921 -Duration 250 -NearRatio 0.75
+start-watchV.cmd -Setup
+start-watchV.cmd -Device 192.168.88.22:43921
+start-watchV.cmd -ConsoleOnly
+start-watchV.cmd -Device 192.168.88.22:43921 -Duration 250 -NearRatio 0.75
 ```
 
 | 参数 | 默认 | 说明 |
@@ -126,7 +144,7 @@ start-swipe.cmd -Device 192.168.88.22:43921 -Duration 250 -NearRatio 0.75
 
 ## 配置文件
 
-`adb-swipe.config.json`（脚本同目录，自动生成）：
+`adb-watchV.config.json`（脚本同目录，自动生成）：
 
 ```json
 {
@@ -164,8 +182,8 @@ start-swipe.cmd -Device 192.168.88.22:43921 -Duration 250 -NearRatio 0.75
 Android 11+ 的常见现象：`adb connect` 注册一条、mDNS 自动连接又注册一条。脚本会自动去掉 mDNS 别名那条（`._adb-tls-connect._tcp` 结尾的）。
 
 **方向键菜单没反应 / 乱码？**
-必须在**真实控制台窗口**里跑（双击 `start-swipe.cmd`）。
-用管道调用（`start-swipe.cmd | something`）时 `ReadKey` 会失效，脚本检测到输入被重定向会降级处理。
+必须在**真实控制台窗口**里跑（双击 `start-watchV.cmd`）。
+用管道调用（`start-watchV.cmd | something`）时 `ReadKey` 会失效，脚本检测到输入被重定向会降级处理。
 
 ---
 

@@ -21,6 +21,10 @@
           Shift + ↓   下滑（手指从屏幕上方划到下方 -> 内容往下滚）
           按住不放会连续滑动（一次滑动做完就补发下一次）。
 
+          每次滑动【默默执行、不打印】—— input swipe 成功时本来就没有输出。
+          累计次数实时显示在窗口标题栏（上滑 / 下滑），
+          Ctrl+C 或关窗口停止时，再给一行合计。
+
     配对成功后的设备地址会存进脚本同目录的 adb-watchV.config.json，
     下次启动它会成为菜单里的默认项（直接回车即用）。
     配对码是一次性的，不会落盘。
@@ -852,6 +856,32 @@ $Yfar  = [int][math]::Floor($H * $FarRatio)  # 屏幕靠上
 
 
 # ---------------------------------------------------------------- 3. 滑动动作
+
+# 计数：只活在本次会话里，关掉窗口就清零
+$script:SwipeUp   = 0
+$script:SwipeDown = 0
+$script:SwipeFail = 0
+
+<# 把计数写进窗口标题栏。
+   之所以挑标题栏而不是控制台里再印一行：滑一次印一行，屏幕很快就被刷满，
+   真正有用的信息全被顶走了。标题栏位置固定、不占正文、任何终端都支持。 #>
+function Update-StatsTitle {
+    $title = "adb-watchV  |  上滑 $script:SwipeUp   下滑 $script:SwipeDown"
+    if ($script:SwipeFail -gt 0) { $title += "   失败 $script:SwipeFail" }
+    try { $Host.UI.RawUI.WindowTitle = $title } catch { }
+}
+
+<# 收尾汇总，退出时打一行 #>
+function Write-StatsSummary {
+    $total = $script:SwipeUp + $script:SwipeDown
+    $line  = "本次共滑动 $total 次（上滑 $script:SwipeUp / 下滑 $script:SwipeDown）"
+    if ($script:SwipeFail -gt 0) { $line += "，失败 $script:SwipeFail 次" }
+    Write-Stamp $line Cyan
+}
+
+<# 一次滑动。
+   成功时【完全安静】—— input swipe 成功本来就不吐任何东西，静默才是正常，
+   计数悄悄加在标题栏上。只有失败才吭一声，免得错误被无声吞掉。 #>
 function Invoke-Swipe {
     param([ValidateSet('Up', 'Down')][string]$Direction)
 
@@ -865,9 +895,20 @@ function Invoke-Swipe {
     $stdout    = Invoke-Adb $arguments
     $code      = $LASTEXITCODE
 
-    if ($code -ne 0) { $color = 'Yellow' } else { $color = 'DarkGray' }
-    Write-Stamp "$arrow swipe $X,$from -> $X,$to  ${Duration}ms" $color
-    Write-AdbRaw -Arguments $arguments -StdOut $stdout -ExitCode $code
+    if ($code -ne 0) {
+        $script:SwipeFail = $script:SwipeFail + 1
+        Update-StatsTitle
+        Write-Stamp "$arrow 滑动失败（adb 返回 $code）" Yellow
+        Write-AdbRaw -Arguments $arguments -StdOut $stdout -ExitCode $code
+        return
+    }
+
+    if ($Direction -eq 'Up') {
+        $script:SwipeUp = $script:SwipeUp + 1
+    } else {
+        $script:SwipeDown = $script:SwipeDown + 1
+    }
+    Update-StatsTitle
 }
 
 
@@ -970,6 +1011,7 @@ public static class HotKeyNative
     }
 
     Write-Host "正在(全局)监听 Shift+↑ / Shift+↓ ... 关窗口或 Ctrl+C 停止" -ForegroundColor Green
+    Write-Stamp "计数在窗口标题栏，退出时给汇总。" DarkGray
 
     try {
         while ($true) {
@@ -988,12 +1030,14 @@ public static class HotKeyNative
         if ($okDown) { [HotKeyNative]::UnregisterHotKeyById($idDown) }
         Write-Host ""
         Write-Stamp "已停止监听，热键已释放。" Cyan
+        Write-StatsSummary
     }
 }
 # ================================================================ 模式 B：只监听本窗口
 else {
 
     Write-Host "正在(本窗口)监听 Shift+↑ / Shift+↓ ... 保持窗口为当前焦点，Ctrl+C 停止" -ForegroundColor Green
+    Write-Stamp "计数在窗口标题栏，退出时给汇总。" DarkGray
 
     try {
         while ($true) {
@@ -1007,5 +1051,6 @@ else {
     } finally {
         Write-Host ""
         Write-Stamp "已停止监听。" Cyan
+        Write-StatsSummary
     }
 }

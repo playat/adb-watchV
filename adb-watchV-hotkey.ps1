@@ -434,66 +434,151 @@ function Read-MenuChoice {
     return $result
 }
 
-<# 自定义行输入，支持【预填文本】：提示后面先摆一段内容、光标跟在它后面，
-   用户可以接着敲，也可以退格删掉重来。Read-Host 做不到这个（它没法预填）。
+<# 一行输入的编辑逻辑（纯函数：只算 buffer 和光标下标，不碰控制台）。
 
-   键位：退格 = 删一个字符；Esc = 整个清空；回车 = 提交。
-   返回去掉首尾空白的文本（预填内容保持不变时，原样返回）。 #>
+   单独拆出来是为了能测 —— "退格之后内容对不上"正是这里最容易错的地方，
+   拆成纯函数就能拿假按键一遍遍验，不用真人在终端里敲。 #>
+function Edit-InputBuffer {
+    param(
+        [string]$Buffer = '',
+        [int]$Caret = 0,
+        [Parameter(Mandatory)][System.ConsoleKeyInfo]$Key
+    )
+
+    if ($Caret -lt 0) { $Caret = 0 }
+    if ($Caret -gt $Buffer.Length) { $Caret = $Buffer.Length }
+
+    $k = $Key.Key
+
+    if ($k -eq [ConsoleKey]::Enter) {
+        return [pscustomobject]@{ Buffer = $Buffer; Caret = $Caret; Action = 'submit' }
+    }
+
+    if ($k -eq [ConsoleKey]::Escape) {
+        return [pscustomobject]@{ Buffer = ''; Caret = 0; Action = 'clear' }
+    }
+
+    if ($k -eq [ConsoleKey]::Backspace) {
+        if ($Caret -gt 0) {
+            $Buffer = $Buffer.Remove($Caret - 1, 1)
+            $Caret  = $Caret - 1
+        }
+        return [pscustomobject]@{ Buffer = $Buffer; Caret = $Caret; Action = 'none' }
+    }
+
+    if ($k -eq [ConsoleKey]::Delete) {
+        if ($Caret -lt $Buffer.Length) { $Buffer = $Buffer.Remove($Caret, 1) }
+        return [pscustomobject]@{ Buffer = $Buffer; Caret = $Caret; Action = 'none' }
+    }
+
+    if ($k -eq [ConsoleKey]::LeftArrow) {
+        if ($Caret -gt 0) { $Caret = $Caret - 1 }
+        return [pscustomobject]@{ Buffer = $Buffer; Caret = $Caret; Action = 'none' }
+    }
+
+    if ($k -eq [ConsoleKey]::RightArrow) {
+        if ($Caret -lt $Buffer.Length) { $Caret = $Caret + 1 }
+        return [pscustomobject]@{ Buffer = $Buffer; Caret = $Caret; Action = 'none' }
+    }
+
+    if ($k -eq [ConsoleKey]::Home) {
+        return [pscustomobject]@{ Buffer = $Buffer; Caret = 0; Action = 'none' }
+    }
+
+    if ($k -eq [ConsoleKey]::End) {
+        return [pscustomobject]@{ Buffer = $Buffer; Caret = $Buffer.Length; Action = 'none' }
+    }
+
+    # 只收 ASCII 可见字符。
+    # 全角数字、全角空格、中文标点长得像，但根本不是同一个字符：
+    # 全角数字连正则的 \d 都能骗过去，最后就是"看着一模一样、就是连不上"。
+    $ch = $Key.KeyChar
+    if ($ch -and ([int]$ch -ge 32) -and ([int]$ch -le 126)) {
+        $Buffer = $Buffer.Insert($Caret, [string]$ch)
+        $Caret  = $Caret + 1
+    }
+
+    return [pscustomobject]@{ Buffer = $Buffer; Caret = $Caret; Action = 'none' }
+}
+
+<# 自定义行输入，支持【预填文本】和退格 / 方向键编辑。
+   Read-Host 做不到预填，所以自己接键。
+
+   重画方式：记住输入区起点（提示语之后的位置），每次改动都
+   「回到起点 -> 整行重写 -> 用空格盖掉上次多出来的部分 -> 光标挪回正确位置」。
+
+   以前是靠 [Console]::Write("\b \b") 发退格符，这招不可靠：有些终端/编码下
+   光标不左移，只留下一个空格，屏幕上就多出一串空格，和真实内容对不上。
+   而人是照着屏幕改地址的 —— 屏幕骗人，改出来的就是 192.168.88.99 这种
+   看着对、其实多一位的地址，然后卡在连接。现在整行重绘，屏幕和 buffer 永远一致。 #>
 function Read-Line {
     param(
         [string]$Prompt = '',
         [string]$Prefill = ''
     )
 
-    $bs = [string][char]8      # 退格
-
     Write-Host $Prompt -ForegroundColor Cyan -NoNewline
-    if ($Prefill) { Write-Host $Prefill -ForegroundColor DarkGray -NoNewline }
-    try { [Console]::ResetColor() } catch { }
 
-    $buffer = $Prefill
+    # 输入区起点 = 提示语结束的位置
+    $anchorLeft = 0
+    $anchorTop  = 0
+    try {
+        $anchorLeft = [Console]::CursorLeft
+        $anchorTop  = [Console]::CursorTop
+    } catch { }
+
+    $buffer   = $Prefill
+    $caret    = $buffer.Length
+    $drawnLen = 0        # 上一帧画了几个字符，用来算要盖掉多少空格
+    $needDraw = $true
+    $submit   = $false
 
     while ($true) {
-        $key = [Console]::ReadKey($true)
-        $k   = $key.Key
 
-        if ($k -eq [ConsoleKey]::Enter) {
+        if ($needDraw) {
+            try {
+                [Console]::SetCursorPosition($anchorLeft, $anchorTop)
+                [Console]::Write($buffer)
+                if ($drawnLen -gt $buffer.Length) {
+                    [Console]::Write((' ' * ($drawnLen - $buffer.Length)))
+                }
+                [Console]::SetCursorPosition($anchorLeft + $caret, $anchorTop)
+            } catch {
+                # 光标定位不可用（输出被重定向等）时，至少别把内容吞掉
+                [Console]::Write($buffer)
+            }
+            $drawnLen = $buffer.Length
+            $needDraw = $false
+        }
+
+        if ($submit) {
             Write-Host ''
             return $buffer.Trim()
         }
 
-        if ($k -eq [ConsoleKey]::Backspace) {
-            if ($buffer.Length -gt 0) {
-                $buffer = $buffer.Substring(0, $buffer.Length - 1)
-                [Console]::Write($bs + ' ' + $bs)
-            }
-            continue
-        }
+        $key  = [Console]::ReadKey($true)
+        $edit = Edit-InputBuffer -Buffer $buffer -Caret $caret -Key $key
 
-        if ($k -eq [ConsoleKey]::Escape) {
-            while ($buffer.Length -gt 0) {
-                $buffer = $buffer.Substring(0, $buffer.Length - 1)
-                [Console]::Write($bs + ' ' + $bs)
-            }
-            continue
-        }
+        $buffer   = $edit.Buffer
+        $caret    = $edit.Caret
+        $needDraw = $true
 
-        # 只收可打印字符，方向键/功能键（KeyChar = 0）直接忽略
-        $ch = $key.KeyChar
-        if ($ch -and ([int]$ch -ge 32) -and ([int]$ch -ne 127)) {
-            $buffer += $ch
-            [Console]::Write($ch)
-        }
+        if ($edit.Action -eq 'submit') { $submit = $true }
     }
 }
 
 <# 地址格式校验：只接受 "IP" 或 "IP:端口"。
-   主要防"预填了 192.168、用户又从头发了一遍"这种误操作 ——
-   那样会拼成 192.168192.168.88.22 这类四不像，这里直接拦下重问。 #>
+
+   两个作用：
+     · 防"预填了 192.168、用户又从头发了一遍"，那样会拼成 192.168192.168.88.22；
+     · 防"看着像其实是别的字符" —— 空白（含全角空格）、全角数字、中文冒号一律不认。
+   用 [0-9] 而不是 \d：在 .NET 里 \d 会匹配全角数字，那是坑。 #>
 function Test-HostPort {
     param([string]$Text)
+
     if (-not $Text) { return $false }
-    return ($Text -match '^\d{1,3}(\.\d{1,3}){3}(:\d{1,5})?$')
+    if ($Text -match '\s') { return $false }        # 任何空白都不允许
+    return ($Text -match '^[0-9]{1,3}(\.[0-9]{1,3}){3}(:[0-9]{1,5})?$')
 }
 
 <# 把 "IP:端口" 或单纯的 "IP" 解析出来，没端口就用默认端口补上 #>
@@ -774,6 +859,7 @@ function Connect-NewDevice {
         $portNumber = 0
         [void][int]::TryParse($cp.Port, [ref]$portNumber)
         $target = "$($cp.Host):$($cp.Port)"
+        Write-Host "  → 实际输入 [$target]" -ForegroundColor DarkGray
 
         if (-not (Test-HostPortOpen -Address $cp.Host -Port $portNumber)) {
             Write-Stamp "$target 端口没开。" Yellow
@@ -849,7 +935,7 @@ function Connect-NewDevice {
     }
 
     $pairTarget = "$($pp.Host):$($pp.Port)"
-    Write-Stamp "pair $pairTarget ******（最多等 20 秒）" Yellow
+    Write-Stamp "pair [$pairTarget] ******（最多等 20 秒）" Yellow
     $pairOut  = Invoke-Adb @('pair', $pairTarget, $code) -TimeoutSec 20
     $pairText = Get-AdbCombinedText -StdOut $pairOut
     $code = $null                    # 配对码用完即弃，不落盘

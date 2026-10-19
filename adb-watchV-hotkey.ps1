@@ -7,12 +7,13 @@
 .DESCRIPTION
     启动后的交互流程：
 
-      [1] 先跑 adb devices -l 看有没有已经连接的设备
+      [1] 先扫一次 mDNS（只扫一次，不等待）：扫到当前端口就直接连上；
+          再跑 adb devices -l 看有没有已经连接的设备
           · 有 -> 用上下方向键选（回车确认），最后一项是"连接新设备…"
           · 没有 -> 直接进引导
 
       [2] 引导（连接新设备），三连尝试，一次比一次多要信息：
-          第 1 次：mDNS 自动发现（会等几秒，因为广播有延迟）-> 列出 -> 选 -> connect
+          第 1 次：mDNS 再扫一次 -> 列出 -> 选 -> connect
           第 2 次：手动输 IP:端口 -> connect
           第 3 次：配对 IP:端口 + 配对码 -> adb pair -> 再 connect
           IP 输入框预填了 "192.168"（内网基本都是这个开头），接着往下敲就行。
@@ -27,9 +28,8 @@
           （上滑 / 下滑 / 点按 次数原地刷新），所以按多少次屏幕都不会被刷满。
           Ctrl+C 或关窗口停止时，再给一行合计。
 
-    配对成功后的设备地址会存进脚本同目录的 adb-watchV.config.json，
-    下次启动它会成为菜单里的默认项（直接回车即用）。
-    配对码是一次性的，不会落盘。
+    不落盘任何东西：设备地址、配对码都不记。每次启动重新扫一次 mDNS，
+    手机重开了无线调试也能自己找到新端口。
 
     默认是【全局热键】：脚本窗口不在前台也照样触发，方便你盯着手机屏幕操作。
     代价是脚本运行期间，Shift+↑ / Shift+↓ / Shift+空格 在整个系统都被本脚本吃掉
@@ -136,32 +136,89 @@ function Resolve-AdbPath {
 # 最近一次 adb 调用的 stderr 原文（adb 的报错基本都往 stderr 写）
 $script:adbStderr = @()
 
-<# 统一的 adb 调用出口：
-   1) 用 2>&1 把 stderr 也收进管道，按 ErrorRecord 挑出来存进 $script:adbStderr ——
-      以前这里是 2>$null 直接丢掉，报错就永远看不见；
-   2) 临时把 ErrorActionPreference 压成 Continue，避免 5.1 里
-      "原生命令写 stderr + Stop"炸出 NativeCommandError 的老毛病；
-   3) 退出码显式回写 global —— 函数里跑原生命令，$LASTEXITCODE 默认传不到调用方。
-   stdout 从管道正常返回，stderr 去读 $script:adbStderr。 #>
-function Invoke-Adb {
-    param([string[]]$Arguments)
+# 最近一次 adb 调用是不是超时被掐掉的（124 这个退出码太抽象，单独记一下）
+$script:adbTimedOut = $false
 
-    $previous = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    $script:adbStderr = @()
+<# PS 5.1 的 ProcessStartInfo 没有 ArgumentList（那是 .NET Core 才加的），
+   只能自己拼命令行。参数里带空格的用双引号包一下就行 —— 我们传的参数都很干净。 #>
+function ConvertTo-ArgToken {
+    param([string]$Token)
+    if (-not $Token) { return '""' }
+    if ($Token -match '\s') { return '"' + $Token + '"' }
+    return $Token
+}
+
+<# 统一的 adb 调用出口。
+
+   为什么不用 `& adb.exe ...` 直接跑：那样【没法设超时】。
+   手机拿走、换了 IP、端口没开的时候，adb connect / adb pair 会闷在那儿
+   等 Windows 的 TCP 重试（几十秒到两分钟），表现就是"一直卡在连接 / 卡在配对"。
+   这里用 Process 跑，到点就 Kill，最多等 TimeoutSec 秒，不会再无限期挂着。
+
+   返回 stdout 行（数组）；stderr 去读 $script:adbStderr；
+   退出码写到 $global:LASTEXITCODE（函数里跑原生命令，默认传不到调用方）；
+   超时被掐掉的，$script:adbTimedOut = $true，退出码记 124。 #>
+function Invoke-Adb {
+    param(
+        [string[]]$Arguments,
+        [int]$TimeoutSec = 30
+    )
+
+    $script:adbStderr   = @()
+    $script:adbTimedOut = $false
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName               = $script:AdbExe
+    $psi.Arguments              = ((@($Arguments) | ForEach-Object { ConvertTo-ArgToken $_ }) -join ' ')
+    $psi.UseShellExecute        = $false
+    $psi.CreateNoWindow         = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError  = $true
+    $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+    $psi.StandardErrorEncoding  = [System.Text.Encoding]::UTF8
+    $workDir = $PSScriptRoot
+    if (-not $workDir) { $workDir = (Get-Location).Path }
+    $psi.WorkingDirectory = $workDir
+
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+
     try {
-        & $script:AdbExe @Arguments 2>&1 | ForEach-Object {
-            if ($_ -is [System.Management.Automation.ErrorRecord]) {
-                $script:adbStderr += $_.ToString()
-            } else {
-                $_
-            }
+        $null = $proc.Start()
+        $outTask = $proc.StandardOutput.ReadToEndAsync()
+        $errTask = $proc.StandardError.ReadToEndAsync()
+
+        if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
+            $script:adbTimedOut = $true
+            try { $proc.Kill() } catch { }
+            try { $null = $proc.WaitForExit(2000) } catch { }
+            $script:adbStderr += "（等了 ${TimeoutSec} 秒没回应，已强制结束）"
         }
-        $global:LASTEXITCODE = $LASTEXITCODE
+
+        $outText = ''
+        $errText = ''
+        try { $outText = $outTask.Result } catch { }
+        try { $errText = $errTask.Result } catch { }
+
+        if ($errText) {
+            $script:adbStderr += @($errText -split "`r?`n" | Where-Object { $_ -ne '' })
+        }
+
+        if ($script:adbTimedOut) {
+            $global:LASTEXITCODE = 124
+        } else {
+            $code = 1
+            try { $code = $proc.ExitCode } catch { }
+            $global:LASTEXITCODE = $code
+        }
+
+        if (-not $outText) { return @() }
+        return @($outText -split "`r?`n" | Where-Object { $_ -ne '' })
     } finally {
-        $ErrorActionPreference = $previous
+        try { $proc.Dispose() } catch { }
     }
 }
+
 
 <# 把最近一次 adb 调用的 stdout + stderr 拼成一段文本，
    用来做"成功了没"的文本判定（adb connect / pair 的退出码并不可靠）。 #>
@@ -197,39 +254,6 @@ function Write-AdbRaw {
     # 有原文就逐行摊开，方便直接复制去喂搜索引擎
     if ($StdOut) { foreach ($line in $StdOut) { Write-Host "      > $line" -ForegroundColor DarkGray } }
     if ($script:adbStderr) { foreach ($line in $script:adbStderr) { Write-Host "      ! $line" -ForegroundColor Yellow } }
-}
-
-
-# ---------------------------------------------------------------- 配置文件
-function Get-ConfigPath {
-    $dir = $PSScriptRoot
-    if (-not $dir) { $dir = (Get-Location).Path }
-    Join-Path $dir 'adb-watchV.config.json'
-}
-
-function Read-Config {
-    $path = Get-ConfigPath
-    if (-not (Test-Path -LiteralPath $path)) { return $null }
-    try {
-        Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
-    } catch {
-        Write-Stamp "配置文件读不动，忽略这次：$($_.Exception.Message)" Yellow
-        $null
-    }
-}
-
-function Save-Config {
-    param([string]$DeviceAddress)
-
-    try {
-        [pscustomobject]@{
-            device  = $DeviceAddress
-            savedAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
-        } | ConvertTo-Json | Set-Content -LiteralPath (Get-ConfigPath) -Encoding UTF8
-        Write-Stamp "已记住设备，下次它会排在菜单第一项。" DarkGray
-    } catch {
-        Write-Stamp "配置写不进去（$($_.Exception.Message)），下次还得重输。" Yellow
-    }
 }
 
 
@@ -490,82 +514,189 @@ function Parse-HostPort {
 }
 
 
+<# 快速探一下 IP:端口 通不通，最多等 TimeoutMs 毫秒。
+
+   有了它，端口没开就能当场说出来，而不是让 adb 去闷等几十秒 ——
+   "无线调试被关掉""端口变了""手机被 DHCP 换了 IP"这三种情况，都会在这一步露馅。 #>
+function Test-HostPortOpen {
+    param(
+        [string]$Address,
+        [int]$Port,
+        [int]$TimeoutMs = 1500
+    )
+
+    if (-not $Address -or -not $Port) { return $false }
+
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $task = $client.ConnectAsync($Address, $Port)
+        if (-not $task.Wait($TimeoutMs)) { return $false }
+        return $client.Connected
+    } catch {
+        return $false
+    } finally {
+        try { $client.Close() } catch { }
+    }
+}
+
+<# 把 adb 服务重启一遍。
+
+   手机拿远再回来之后，adb 服务里通常还留着两样脏东西：
+     · 一条指向上次那个端口 / IP 的死连接（adb connect 会回 "already connected"，其实早死了）
+     · 旧的 mDNS 缓存（端口明明变了，它还在报老端口）
+   kill-server 是唯一能一次清掉这两样的动作。清完再扫，看到的才是手机现在真正的端口。
+
+   只杀电脑这边的 adb 服务：不动 USB 设备，也不影响手机上的调试授权。 #>
+function Restart-AdbServer {
+    Write-Stamp "重启 adb 服务（清掉上次的死连接和旧 mDNS 缓存）..." DarkGray
+    Invoke-Adb @('kill-server') -TimeoutSec 10 | Out-Null
+    Start-Sleep -Milliseconds 300
+    $null = Invoke-Adb @('start-server') -TimeoutSec 20
+
+    if ($script:adbTimedOut -or $LASTEXITCODE -ne 0) {
+        Write-Stamp "adb 服务没起来，后面大概率连不上。" Yellow
+        foreach ($line in $script:adbStderr) { Write-Host "      ! $line" -ForegroundColor Yellow }
+        return $false
+    }
+    return $true
+}
+
+<# 只取 connect 服务的地址。
+
+   配对端口（_adb-tls-pairing）【不能用来连接】，混进候选里只会白试一场；
+   反过来，拿连接端口去配对更糟：端口是开的，adb 会一直等那个永远不来的配对握手。 #>
+function Get-MdnsConnectTargets {
+    param([string]$HostName = '')
+
+    $list = @(Get-MdnsServices | Where-Object { $_.Service -eq 'connect' })
+    if ($HostName) { $list = @($list | Where-Object { $_.Host -eq $HostName }) }
+
+    $targets = New-Object System.Collections.Generic.List[string]
+    foreach ($d in $list) {
+        $addr = "$($d.Host):$($d.Port)"
+        if (-not $targets.Contains($addr)) { $targets.Add($addr) }
+    }
+    return $targets.ToArray()
+}
+
+
 # ---------------------------------------------------------------- 配对 + 连接
-<# mDNS 扫描：等手机把无线调试的 mDNS 广播发出来。
-   adb mdns services 刚开无线调试时经常是空的 —— 广播有延迟，所以要等。
-   扫一次，空就隔一秒重扫，最多等 MaxWaitSec 秒；期间按任意键提前结束等待。 #>
-function Get-MdnsDevices {
-    param([int]$MaxWaitSec = 6)
+<# mDNS 扫描：只扫一次，不等、不循环。
 
-    $deadline = (Get-Date).AddSeconds($MaxWaitSec)
+   以前这里会反复重扫最多 8 秒，等手机把广播发出来。实际用下来体验很差：
+   手机没开无线调试时，每次启动都白等 8 秒，然后照样失败。
+   现在就是「问一句，有就有，没有就算」—— 扫不到直接走后面的手动输入 / 配对流程。 #>
+function Get-MdnsServices {
+
     $found = New-Object System.Collections.Generic.List[object]
-    $waited = $false
+    $raw = Invoke-Adb @('mdns', 'services')
 
-    while ((Get-Date) -lt $deadline) {
-        $raw = Invoke-Adb @('mdns', 'services')
-
-        foreach ($line in @($raw)) {
-            if (-not $line) { continue }
-            if ($line -match '^\s*List of') { continue }
-            # 只关心 connect 服务；pairing 服务也顺手带上端口信息
-            if ($line -match '_adb-tls-(connect|pairing)\._tcp\.?\s+([0-9\.]+):(\d+)') {
-                $found.Add([pscustomobject]@{
-                    Service = $Matches[1]     # connect / pairing
-                    Host    = $Matches[2]
-                    Port    = $Matches[3]
-                })
-            }
+    foreach ($line in @($raw)) {
+        if (-not $line) { continue }
+        if ($line -match '^\s*List of') { continue }
+        # 只关心 connect / pairing 两种服务
+        if ($line -match '_adb-tls-(connect|pairing)\._tcp\.?\s+([0-9\.]+):(\d+)') {
+            $found.Add([pscustomobject]@{
+                Service = $Matches[1]     # connect / pairing
+                Host    = $Matches[2]
+                Port    = $Matches[3]
+            })
         }
-
-        if ($found.Count -gt 0) { break }
-
-        $waited = $true
-        Write-Host "  正在等 mDNS 广播 ..." -ForegroundColor DarkGray -NoNewline
-        Start-Sleep -Seconds 1
-        Write-Host ""
     }
 
-    if (-not $waited) { return $found }
     return $found
 }
 
 <# 尝试连接一个地址，返回是否真的连上了。
-   会先 disconnect 再 connect（清掉旧连接），然后靠 Test-DeviceOnline 判定。 #>
+
+   顺序：先探端口（不通直接判失败，不让 adb 去卡）
+        -> adb disconnect（只断 TCP，不碰 USB）
+        -> adb connect（带超时）
+        -> 看看设备列表里到底有没有它
+
+   重试几次是必要的：手机刚重开无线调试的头一两秒端口还没 listen，
+   第一次 connect 常常直接 "Connection refused"，隔一秒再连就上了 ——
+   这也是"反复试好几次突然又能连"的由来之一。 #>
 function Try-Connect {
-    param([string]$Target)
+    param(
+        [string]$Target,
+        [int]$Attempts = 3,
+        [switch]$Compact          # 启动时自动连用：只报结果，不摊 adb 原文
+    )
 
     if (-not $Target) { return $false }
 
-    Invoke-Adb @('disconnect', $Target) | Out-Null
-    Write-Stamp "连接：adb connect $Target" Yellow
-    $out  = Invoke-Adb @('connect', $Target)
-    $text = Get-AdbCombinedText -StdOut $out
-    Write-AdbRaw -Arguments @('connect', $Target) -StdOut $out -ExitCode $LASTEXITCODE
+    $hp = Parse-HostPort -Text $Target
+    if (-not $hp) { return $false }
+    $portNumber = 0
+    [void][int]::TryParse($hp.Port, [ref]$portNumber)
 
-    Start-Sleep -Milliseconds 800
-
-    if (Test-DeviceOnline $Target) {
-        Write-Stamp "设备已上线：$Target" Green
-        Save-Config -DeviceAddress $Target
-        return $true
+    if (-not (Test-HostPortOpen -Address $hp.Host -Port $portNumber)) {
+        Write-Stamp "$Target 端口没开（没监听 / 端口已经变了）" Yellow
+        return $false
     }
 
-    # 兜底：旧版 adb 报的地址和实际登记的可能不一样，在线列表恰好一台就认它
-    $online = @(Get-DeviceList | Where-Object { $_.State -eq 'device' })
-    if ($online.Count -eq 1 -and $text -match 'connected to|already connected') {
-        Write-Stamp "连上了（实际登记地址是 $($online[0].Serial)）" Green
-        Save-Config -DeviceAddress $online[0].Serial
-        return $true
+    Invoke-Adb @('disconnect') -TimeoutSec 10 | Out-Null
+
+    for ($i = 1; $i -le $Attempts; $i++) {
+
+        if ($i -gt 1) {
+            Write-Stamp "第 $i 次重试连接 $Target ..." DarkGray
+            Start-Sleep -Milliseconds 1200
+        } elseif ($Compact) {
+            Write-Stamp "连接 $Target ..." DarkGray
+        } else {
+            Write-Stamp "连接：adb connect $Target" Yellow
+        }
+
+        $out  = Invoke-Adb @('connect', $Target) -TimeoutSec 20
+        $text = Get-AdbCombinedText -StdOut $out
+
+        # 第一次给全量原文（方便排查），重试只给一行结论，免得刷屏
+        if ($i -eq 1 -and -not $Compact) {
+            Write-AdbRaw -Arguments @('connect', $Target) -StdOut $out -ExitCode $LASTEXITCODE
+        } elseif ($text) {
+            $brief = ($text -replace "`r?`n", ' / ')
+            Write-Host "    $brief" -ForegroundColor DarkGray
+        }
+
+        Start-Sleep -Milliseconds 700
+
+        if (Test-DeviceOnline $Target) {
+            Write-Stamp "设备已上线：$Target" Green
+            return $true
+        }
+
+        # 兜底：adb 实际登记的可能不是我们给的地址（mDNS 别名），
+        # 在线列表里恰好只有一台、而且 connect 说成功了，就认它
+        $online = @(Get-DeviceList | Where-Object { $_.State -eq 'device' })
+        if ($online.Count -eq 1 -and $text -match 'connected to|already connected') {
+            Write-Stamp "连上了（实际登记地址是 $($online[0].Serial)）" Green
+            return $true
+        }
+
+        if ($script:adbTimedOut) {
+            Write-Stamp "adb 20 秒没回应，这个地址多半是死的，不重试了。" Yellow
+            break
+        }
     }
 
     return $false
 }
 
-<# 连接新设备，三连尝试：
-      第 1 次：mDNS 自动发现 -> 列出 -> 选一个 -> connect
-      第 2 次：手动输 IP:端口 -> connect
+<# 连接新设备，三连尝试，一次比一次多要信息：
+      第 1 次：mDNS 自动发现（会等几秒，广播有延迟）-> 列出 -> 选 -> connect
+      第 2 次：手动输「连接 IP:端口」-> connect
       第 3 次：配对（pair）-> 再 connect
-   返回连上的设备地址；失败返回空字符串。 #>
+   返回连上的设备地址；失败返回空字符串。
+
+   ── "手机拿远再回来就连不上" 是怎么回事 ──
+   手机离开 Wi-Fi 一段时间再回来，这三样东西都会变：
+     1) adb 服务里留着一条指向上次端口的死连接；
+     2) adb 服务缓存着旧的 mDNS 记录（还在报老端口）；
+     3) 手机重新打开无线调试后，【连接端口一定是新的】，IP 也可能被 DHCP 换掉。
+   所以流程第一件事是 kill-server 把 1、2 清干净，第二件事是重新发现端口，
+   而不是拿上次那个端口反复硬连 —— 那只会一直卡在"连接中"。 #>
 function Connect-NewDevice {
 
     if (-not (Test-Interactive)) {
@@ -576,26 +707,37 @@ function Connect-NewDevice {
     Write-Host ""
     Write-Host "--- 连接新设备 ---" -ForegroundColor Cyan
     Write-Host "手机上：设置 > 开发者选项 > 无线调试" -ForegroundColor DarkGray
+    Write-Host "重开无线调试之后端口会变；一般不用重新配对，连上新端口就行。" -ForegroundColor DarkGray
     Write-Host ""
 
-    # ============ 第 1 次尝试：mDNS 自动发现 ============
-    Write-Host "[1/3] mDNS 自动发现 ..." -ForegroundColor White
-    $mdns = @(Get-MdnsDevices -MaxWaitSec 6)
+    Restart-AdbServer | Out-Null
 
-    if ($mdns.Count -gt 0) {
-        # 去重（同一台手机的 connect / pairing 两个服务都要，但按 host:port 归并）
+    # 已知的【连接端口】。后面配对时要拿它做反查：
+    # 如果用户把连接端口填进了配对输入框，必须当场拦下来，否则 adb pair 会一直卡着。
+    $knownConnect = New-Object System.Collections.Generic.List[string]
+
+    # ============ 第 1 次尝试：mDNS 自动发现 ============
+    Write-Host ""
+    Write-Host "[1/3] mDNS 扫一次 ..." -ForegroundColor White
+    $mdns        = @(Get-MdnsServices)
+    $connectOnes = @($mdns | Where-Object { $_.Service -eq 'connect' })
+
+    if ($connectOnes.Count -gt 0) {
+
         $items  = New-Object System.Collections.Generic.List[string]
         $values = New-Object System.Collections.Generic.List[string]
 
-        foreach ($d in $mdns) {
+        foreach ($d in $connectOnes) {
             $addr = "$($d.Host):$($d.Port)"
-            $svc  = if ($d.Service -eq 'pairing') { '配对' } else { '连接' }
-            $items.Add($addr.PadRight(24) + $svc)
+            if ($values.Contains($addr)) { continue }        # 同一条服务可能重复广播
+            $items.Add($addr.PadRight(24) + '连接')
             $values.Add($addr)
+            if (-not $knownConnect.Contains($addr)) { $knownConnect.Add($addr) }
         }
 
-        Write-Host "  发现 $($mdns.Count) 个服务，选一个连接：" -ForegroundColor DarkGray
+        Write-Host "  发现 $($values.Count) 个可连接地址：" -ForegroundColor DarkGray
         $idx = Read-MenuChoice -Items $items.ToArray()
+
         if ($idx -ge 0) {
             $target = $values[$idx]
             if (Try-Connect -Target $target) { return $target }
@@ -603,76 +745,157 @@ function Connect-NewDevice {
         } else {
             Write-Host "  跳过 mDNS，改手动输入。" -ForegroundColor DarkGray
         }
+
+    } elseif ($mdns.Count -gt 0) {
+        Write-Stamp "只扫到配对端口，没有可连接的端口。" Yellow
+        Write-Host "  配对端口不能用来连接；回手机看『无线调试』主页那个 IP:端口。" -ForegroundColor DarkGray
     } else {
-        Write-Stamp "mDNS 没发现设备。" Yellow
+        Write-Stamp "mDNS 没发现设备（手机和电脑可能不在同一网段，或者路由器挡了组播）。" Yellow
     }
 
     # ============ 第 2 次尝试：手动输 IP:端口 ============
     Write-Host ""
     Write-Host "[2/3] 手动输入连接地址" -ForegroundColor White
-    Write-Host "  手机『无线调试』主页里的 IP:端口" -ForegroundColor DarkGray
+    Write-Host "  手机『无线调试』主页上那个 IP:端口（不是配对弹窗里的）" -ForegroundColor DarkGray
+    Write-Host "  不想输、想直接去配对：原样回车就行。" -ForegroundColor DarkGray
 
-    $connAnswer = ''
-    while ($true) {
-        $connAnswer = Read-Line -Prompt '  连接 IP:端口  ' -Prefill '192.168'
-        if ($connAnswer -and $connAnswer -ne '192.168' -and (Test-HostPort $connAnswer)) { break }
-        Write-Host "  地址不对" -ForegroundColor Yellow
+    $cp     = $null
+    $cpLive = $false        # 第 2 步那个端口是不是真的探通过（防止拿过期端口去误判配对端口）
+    for ($round = 1; $round -le 3; $round++) {
+
+        $answer = Read-Line -Prompt '  连接 IP:端口  ' -Prefill '192.168'
+        if (-not $answer -or $answer -eq '192.168') { break }        # 直接去配对
+        if (-not (Test-HostPort $answer)) {
+            Write-Host "  地址不对" -ForegroundColor Yellow
+            continue
+        }
+
+        $cp = Parse-HostPort -Text $answer -DefaultPort '5555'
+        $portNumber = 0
+        [void][int]::TryParse($cp.Port, [ref]$portNumber)
+        $target = "$($cp.Host):$($cp.Port)"
+
+        if (-not (Test-HostPortOpen -Address $cp.Host -Port $portNumber)) {
+            Write-Stamp "$target 端口没开。" Yellow
+            Write-Host "  常见原因：端口变了 / 无线调试被关了 / 手机换了 IP。" -ForegroundColor DarkGray
+            Write-Host "  回手机重看一眼那个端口，再输一次。" -ForegroundColor DarkGray
+            continue
+        }
+
+        $cpLive = $true
+        if (Try-Connect -Target $target) { return $target }
+        Write-Stamp "端口通，但 adb 没握上手（多半是没配对过，或者配对码过期了）。" Yellow
+        break
     }
-
-    $cp = Parse-HostPort -Text $connAnswer -DefaultPort '5555'
-    $target = "$($cp.Host):$($cp.Port)"
-
-    if (Try-Connect -Target $target) { return $target }
-    Write-Stamp "第 2 次尝试失败，需要配对。" Yellow
 
     # ============ 第 3 次尝试：配对 -> 再连接 ============
     Write-Host ""
     Write-Host "[3/3] 配对" -ForegroundColor White
-    Write-Host "  手机上点『使用配对码配对设备』，对话框里有 IP:端口 和 6 位码" -ForegroundColor DarkGray
+    Write-Host "  手机上点『使用配对码配对设备』，弹窗里有 IP:端口 和 6 位码。" -ForegroundColor DarkGray
+    Write-Host "  注意：弹窗里那个是【配对端口】，跟主页的连接端口不是一回事，每次重开都会变。" -ForegroundColor Yellow
+    Write-Host "  必须照着当前这个弹窗抄；抄上一次的，就会一直卡在配对。" -ForegroundColor DarkGray
 
-    # 配对地址
-    $pairAnswer = ''
-    while ($true) {
-        $pairAnswer = Read-Line -Prompt '  配对 IP:端口  ' -Prefill '192.168'
-        if ($pairAnswer -and $pairAnswer -ne '192.168' -and (Test-HostPort $pairAnswer)) { break }
-        Write-Host "  地址不对" -ForegroundColor Yellow
+    $pp   = $null
+    $ppOk = $false
+
+    for ($round = 1; $round -le 3; $round++) {
+
+        $pairAnswer = ''
+        while ($true) {
+            $pairAnswer = Read-Line -Prompt '  配对 IP:端口  ' -Prefill '192.168'
+            if ($pairAnswer -and $pairAnswer -ne '192.168' -and (Test-HostPort $pairAnswer)) { break }
+            Write-Host "  地址不对" -ForegroundColor Yellow
+        }
+
+        $pp = Parse-HostPort -Text $pairAnswer -DefaultPort '37123'
+        $pairPort = 0
+        [void][int]::TryParse($pp.Port, [ref]$pairPort)
+        $pairAddr = "$($pp.Host):$($pp.Port)"
+
+        # 拿连接端口去配对 = adb 会卡死：端口是开的，但对面不是配对服务，
+        # 握手永远等不到回应（这正是"输入全都对，卡在配对"的一个真凶）。
+        if ($cpLive -and $cp -and $cp.Host -eq $pp.Host -and $cp.Port -eq $pp.Port) {
+            Write-Stamp "$pairAddr 是【连接端口】，不是配对端口。" Yellow
+            Write-Host "  配对端口在『使用配对码配对设备』的弹窗里，每次都不一样。" -ForegroundColor DarkGray
+            continue
+        }
+        if ($knownConnect.Contains($pairAddr)) {
+            Write-Stamp "$pairAddr 是刚才扫到的【连接端口】，配对请填弹窗里那个。" Yellow
+            continue
+        }
+
+        if (Test-HostPortOpen -Address $pp.Host -Port $pairPort -TimeoutMs 2000) {
+            $ppOk = $true
+            break
+        }
+
+        Write-Stamp "$pairAddr 连不上 —— 手机上的配对弹窗还开着吗？" Yellow
+        Write-Host "  弹窗一关端口就没了；重开一个会换新端口，重新抄一遍。" -ForegroundColor DarkGray
     }
-    $pp = Parse-HostPort -Text $pairAnswer -DefaultPort '37123'
-    $pairTarget = "$($pp.Host):$($pp.Port)"
 
-    # 配对码
+    if (-not $ppOk) {
+        Write-Host ""
+        Write-Host "配对端口一直连不上，这次先不配了。" -ForegroundColor Red
+        Write-Host "  1. 确认『使用配对码配对设备』的弹窗还开着（它一关端口就没了）。" -ForegroundColor DarkGray
+        Write-Host "  2. 手机和电脑是不是同一个 Wi-Fi？访客网络 / AP 隔离会直接不通。" -ForegroundColor DarkGray
+        Write-Host "  3. 把无线调试关掉再打开，重新运行本脚本。" -ForegroundColor DarkGray
+        return ''
+    }
+
     $code = ''
     while (-not $code) {
         $code = Read-Line -Prompt '  配对码  '
         if (-not $code) { Write-Host "  不能空" -ForegroundColor Yellow }
     }
 
-    Write-Stamp "pair $pairTarget ******" Yellow
-    $pairOut  = Invoke-Adb @('pair', $pairTarget, $code)
+    $pairTarget = "$($pp.Host):$($pp.Port)"
+    Write-Stamp "pair $pairTarget ******（最多等 20 秒）" Yellow
+    $pairOut  = Invoke-Adb @('pair', $pairTarget, $code) -TimeoutSec 20
     $pairText = Get-AdbCombinedText -StdOut $pairOut
-    $code = $null          # 配对码用完即弃
-
+    $code = $null                    # 配对码用完即弃，不落盘
     Write-AdbRaw -Arguments @('pair', $pairTarget, '******') -StdOut $pairOut -ExitCode $LASTEXITCODE
 
     if ($pairText -match 'Successfully paired') {
         Write-Stamp "配对成功" Green
     } else {
-        Write-Stamp "配对失败：配对码可能已过期，把对话框重开一个" Yellow
+        Write-Stamp "配对没成功：配对码或端口过期了（弹窗重开会同时换掉这两个）。" Yellow
+        if ($script:adbTimedOut) {
+            Write-Host "  adb pair 等了 20 秒没回应，已经掐掉 —— 那个端口上没有配对服务。" -ForegroundColor DarkGray
+            Write-Host "  最常见的原因：填的是主页的连接端口，不是弹窗里的配对端口。" -ForegroundColor DarkGray
+        }
     }
 
-    # 配对完再连一次 —— 优先试连接端口（配对端口连不上）
-    $connPort = $cp.Port
-    $finalTarget = "$($pp.Host):$connPort"
+    # ---- 配对之后：端口必须重新发现 ----
+    # 配对端口只能用来配对；连接端口是另一个（主页上显示的那个）。
+    # 而且此刻手机已经换过端口了，第 2 步输的那个基本是旧的，
+    # 所以先扫 mDNS 拿现端口，扫不到再退回去试旧端口。
+    Start-Sleep -Milliseconds 1200
+
+    $candidates = New-Object System.Collections.Generic.List[string]
+
+    foreach ($c in @(Get-MdnsConnectTargets -HostName $pp.Host)) {
+        if (-not $candidates.Contains($c)) { $candidates.Add($c) }
+    }
+    if ($cp -and $cp.Host -eq $pp.Host) {
+        $c = "$($cp.Host):$($cp.Port)"
+        if (-not $candidates.Contains($c)) { $candidates.Add($c) }
+    }
+    $c = "$($pp.Host):5555"
+    if (-not $candidates.Contains($c)) { $candidates.Add($c) }
 
     Write-Host ""
-    Write-Stamp "配对后重新连接 ..." Yellow
-    if (Try-Connect -Target $finalTarget) { return $finalTarget }
+    Write-Stamp "配对后重新连接（mDNS 现端口 -> 刚才输的端口 -> 5555 依次试）..." Yellow
 
-    # 配对端口和连接端口可能不同，试一下用 pair 拿到的 host + 常见连接端口
-    if (Try-Connect -Target "$($pp.Host):5555") { return "$($pp.Host):5555" }
+    foreach ($c in $candidates) {
+        if (Try-Connect -Target $c -Attempts 2) { return $c }
+    }
 
     Write-Host ""
-    Write-Host "三次都失败。同一 Wi-Fi？无线调试还开着？" -ForegroundColor Red
+    Write-Host "三次都失败。按这个顺序排查：" -ForegroundColor Red
+    Write-Host "  1. 手机和电脑是不是同一个 Wi-Fi？（访客网络 / AP 隔离会直接不通）" -ForegroundColor DarkGray
+    Write-Host "  2. 手机『无线调试』还开着吗？主页的 IP:端口 和配对弹窗的端口不是一回事。" -ForegroundColor DarkGray
+    Write-Host "  3. 手机 IP 变了吗？（重连 Wi-Fi 常被 DHCP 换掉，以手机屏幕上显示的为准）" -ForegroundColor DarkGray
+    Write-Host "  4. 还不行就把无线调试关掉再打开，重新运行脚本（每次都会先清一遍 adb 服务）。" -ForegroundColor DarkGray
     return ''
 }
 
@@ -695,11 +918,19 @@ function Resolve-Device {
         return $Explicit
     }
 
-    $config     = Read-Config
-    $remembered = ''
-    if ($config -and $config.device) { $remembered = [string]$config.device }
-
     if (-not $ForceSetup) {
+
+        # 每次启动先扫一次 mDNS：手机重开无线调试后连接端口会变，
+        # 扫到就直接用当前端口连上；扫不到就往下走正常流程。
+        Write-Stamp "扫一下 mDNS ..." DarkGray
+        $discovered = @(Get-MdnsConnectTargets)
+        if ($discovered.Count -gt 0) {
+            foreach ($t in $discovered) {
+                if (Try-Connect -Target $t -Attempts 2 -Compact) { break }
+            }
+        } else {
+            Write-Stamp "没扫到（不代表连不上，接着看 adb 里有没有现成的）。" DarkGray
+        }
 
         Write-Stamp "正在查看 adb 里已连接的设备 ..." DarkGray
         $all     = @(Get-DeviceList)
@@ -722,17 +953,12 @@ function Resolve-Device {
             # 组菜单项
             $items  = New-Object System.Collections.Generic.List[string]
             $values = New-Object System.Collections.Generic.List[string]
-            $defaultIndex = 0
 
             foreach ($d in $online) {
                 $tail = $d.Model
                 if (-not $tail) { $tail = Get-StateText $d.State }
-                $label = $d.Serial.PadRight(30) + $tail
-                $items.Add($label)
+                $items.Add($d.Serial.PadRight(30) + $tail)
                 $values.Add($d.Serial)
-                if ($remembered -and $d.Serial -eq $remembered) {
-                    $defaultIndex = $items.Count - 1
-                }
             }
 
             # 离线 / 未授权的也列出来，但选不中（选了只给提示）
@@ -775,7 +1001,6 @@ function Resolve-Device {
                     continue
                 }
 
-                Save-Config -DeviceAddress $choice
                 return $choice
             }
         }

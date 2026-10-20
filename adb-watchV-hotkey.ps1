@@ -12,6 +12,10 @@
           · 有 -> 用上下方向键选（回车确认），最后一项是"连接新设备…"
           · 没有 -> 直接进引导
 
+          有线和无线都认：USB 序列号标 (USB)，ip:端口 标 (无线)。
+          两个同时连着也能同时列出来，选谁就把手势发给谁。
+          有线不用配对、端口也不会变，无线抽风时插根线就能接着用。
+
       [2] 引导（连接新设备），三连尝试，一次比一次多要信息：
           第 1 次：mDNS 再扫一次 -> 列出 -> 选 -> connect
           第 2 次：手动输 IP:端口 -> connect
@@ -350,6 +354,23 @@ function Get-StateText {
         'sideload'     { 'sideload' }
         default        { $State }
     }
+}
+
+<# 这条设备是插线的还是走 Wi-Fi 的。
+
+   adb 的序列号本身就分了三种长相：
+     · 192.168.1.5:41234 / localhost:5555      -> TCP，无线
+     · adb-xxxx-xxxx._adb-tls-connect._tcp     -> mDNS 自动连上的，也是无线
+     · R5CT30XXXXX / 0123456789ABCDEF          -> USB 序列号，有线
+   有线的序列号是固定的，不像无线端口每次重开都变，这也是插线最省心的地方。 #>
+function Get-LinkKind {
+    param([string]$Serial)
+
+    if (-not $Serial) { return '未知' }
+    if ($Serial -match ':\d+$') { return '无线' }
+    if ($Serial -match '\._adb-tls-connect\._tcp$') { return '无线' }
+    if ($Serial -match '^emulator-') { return '模拟器' }
+    return 'USB'
 }
 
 
@@ -1043,13 +1064,15 @@ function Resolve-Device {
             foreach ($d in $online) {
                 $tail = $d.Model
                 if (-not $tail) { $tail = Get-StateText $d.State }
-                $items.Add($d.Serial.PadRight(30) + $tail)
+                $kind = Get-LinkKind $d.Serial
+                $items.Add($d.Serial.PadRight(30) + $tail + "  ($kind)")
                 $values.Add($d.Serial)
             }
 
             # 离线 / 未授权的也列出来，但选不中（选了只给提示）
             foreach ($d in $pending) {
-                $label = $d.Serial.PadRight(30) + (Get-StateText $d.State)
+                $kind  = Get-LinkKind $d.Serial
+                $label = $d.Serial.PadRight(30) + (Get-StateText $d.State) + "  ($kind)"
                 $items.Add($label)
                 $values.Add("__pending__$($d.Serial)|$($d.State)")
             }
@@ -1061,7 +1084,14 @@ function Resolve-Device {
 
             while ($true) {
 
-                $title = "adb 里检测到 $($online.Count) 台可用设备，请选择："
+                $title = "检测到 $($online.Count) 台可用设备"
+                $parts = @()
+                $usbCount  = @($online | Where-Object { (Get-LinkKind $_.Serial) -eq 'USB' }).Count
+                $wifiCount = @($online | Where-Object { (Get-LinkKind $_.Serial) -eq '无线' }).Count
+                if ($usbCount  -gt 0) { $parts += "USB $usbCount" }
+                if ($wifiCount -gt 0) { $parts += "无线 $wifiCount" }
+                if ($parts.Count -gt 0) { $title += "（" + ($parts -join ' / ') + "）" }
+                $title += "，请选择：\"
                 $idx = Read-MenuChoice -Items $items.ToArray() -Title $title
 
                 if ($idx -lt 0) {
@@ -1092,7 +1122,19 @@ function Resolve-Device {
         }
         else {
             Write-Host ""
-            Write-Host "adb 里没有在线的设备，走一遍连接流程。" -ForegroundColor DarkGray
+            if ($pending.Count -gt 0) {
+                # 常见情形：线插上了但手机还没点"允许 USB 调试"，或者无线那条掉线了。
+                # 这时候不该直接把人推去配对，先告诉他这些设备为什么用不了。
+                Write-Host "adb 里看到了设备，但状态还不允许调试：" -ForegroundColor Yellow
+                foreach ($d in $pending) {
+                    $kind = Get-LinkKind $d.Serial
+                    Write-Host "    $($d.Serial)  $(Get-StateText $d.State)  ($kind)" -ForegroundColor DarkGray
+                }
+                Write-Host "  插线的：在手机弹窗里点『允许 USB 调试』（勾上『一律允许』），然后重跑脚本。" -ForegroundColor DarkGray
+                Write-Host "  接着往下走无线连接流程也可以。" -ForegroundColor DarkGray
+            } else {
+                Write-Host "adb 里没有在线的设备，走一遍连接流程。" -ForegroundColor DarkGray
+            }
         }
     }
 

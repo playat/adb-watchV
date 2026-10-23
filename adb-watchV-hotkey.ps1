@@ -11,6 +11,9 @@
           再跑 adb devices -l 看有没有已经连接的设备
           · 有 -> 用上下方向键选（回车确认），最后一项是"连接新设备…"
           · 没有 -> 直接进引导
+          · 离线 / 未授权 -> 也会列进菜单（标「离线」「未授权」），
+                    离线的那台选中就问你「要不要重新连接」，
+                    答「要」就先清死连接、再重扫 mDNS 把当前端口找回来
 
           有线和无线都认：USB 序列号标 (USB)，ip:端口 标 (无线)。
           两个同时连着也能同时列出来，选谁就把手势发给谁。
@@ -1007,6 +1010,118 @@ function Connect-NewDevice {
 }
 
 
+# ---------------------------------------------------------------- 离线救援
+<# 设备不在线时问一句「要不要重连」。返回 $true 表示"要"。
+
+   只在 offline 用 —— unauthorized 是手机上没点允许，重连一万次也没用。
+   非交互环境（管道 / 重定向）问不了人，直接返回 $false，别擅自去连。 #>
+function Confirm-Reconnect {
+    param(
+        [string]$Serial,
+        [string]$State = 'offline'
+    )
+
+    if (-not $Serial) { return $false }
+    if (-not (Test-Interactive)) { return $false }
+
+    $kind = Get-LinkKind $Serial
+
+    Write-Host ""
+    Write-Stamp "$Serial 已经离线了（$(Get-StateText $State) · $kind）。" Yellow
+
+    if ($kind -eq 'USB') {
+        Write-Host "  线还插着吗？手机锁屏久了也会把 USB 调试授权收回。" -ForegroundColor DarkGray
+    } else {
+        Write-Host "  无线掉线很常见：手机走远了、锁屏久了，或者重开无线调试后端口变了。" -ForegroundColor DarkGray
+    }
+
+    $idx = Read-MenuChoice -Title '要试着重新连接吗？' -Items @(
+        '重新连接（先清掉死连接，再重扫端口）',
+        '跳过，先不连'
+    )
+
+    return ($idx -eq 0)
+}
+
+<# 把一台已经离线的设备救回来。成功返回 $true。
+
+   无线：手机重开无线调试后【连接端口一定会变】，所以顺序是
+         adb disconnect <地址>       清掉那条指向上次端口的死连接
+      -> 按原地址试一次              端口没变的话这一步就通了，最快
+      -> 只扫一次 mDNS 找当前端口    优先同一台 IP，再依次试别的
+   有线：adb reconnect <序列号>，只动这一台；不行再整体 reconnect offline。
+
+   mDNS 只扫一次，不轮询 —— 跟启动流程一致，扫不到就如实说扫不到。 #>
+function Repair-Device {
+    param([string]$Serial)
+
+    if (-not $Serial) { return $false }
+
+    $kind = Get-LinkKind $Serial
+
+    if ($kind -ne '无线') {
+
+        Write-Stamp "重连 $Serial ..." DarkGray
+        $null = Invoke-Adb @('reconnect', $Serial) -TimeoutSec 15
+        Start-Sleep -Milliseconds 800
+        if (Test-DeviceOnline -Address $Serial) {
+            Write-Stamp "设备已恢复：$Serial" Green
+            return $true
+        }
+
+        # 有些 adb 版本不认 "reconnect <序列号>"，退回整体重连一次
+        Write-Stamp "再试一次（reconnect offline）..." DarkGray
+        $null = Invoke-Adb @('reconnect', 'offline') -TimeoutSec 15
+        Start-Sleep -Milliseconds 800
+        if (Test-DeviceOnline -Address $Serial) {
+            Write-Stamp "设备已恢复：$Serial" Green
+            return $true
+        }
+
+        Write-Stamp "USB 设备还是没回来 —— 拔插一下数据线，或在手机上重新点『允许 USB 调试』。" Yellow
+        return $false
+    }
+
+    $isAlias = ($Serial -match '\._adb-tls-connect\._tcp$')
+    $hp      = Parse-HostPort -Text $Serial
+
+    # 1) 清死连接 + 原地址试一次（mDNS 别名没法当地址用，跳过这步）
+    if (-not $isAlias) {
+        Write-Stamp "清掉旧连接：adb disconnect $Serial" DarkGray
+        $null = Invoke-Adb @('disconnect', $Serial) -TimeoutSec 10
+        if (Try-Connect -Target $Serial -Attempts 2 -Compact) { return $true }
+    }
+
+    # 2) 端口变了（重开无线调试必然变）：扫一次 mDNS，优先同一台 IP
+    Write-Stamp "端口可能变了，扫一下 mDNS ..." DarkGray
+    $found = @(Get-MdnsConnectTargets)
+
+    $candidates = New-Object System.Collections.Generic.List[string]
+    if ($hp -and -not $isAlias) {
+        $hostPattern = '^' + [regex]::Escape($hp.Host) + ':'
+        foreach ($t in $found) {
+            if ($t -match $hostPattern -and -not $candidates.Contains($t)) { $candidates.Add($t) }
+        }
+    }
+    foreach ($t in $found) {
+        if (-not $candidates.Contains($t)) { $candidates.Add($t) }
+    }
+
+    if ($candidates.Count -eq 0) {
+        Write-Stamp "mDNS 没扫到可连接的地址（手机可能没回到这个 Wi-Fi，或无线调试没开）。" Yellow
+        return $false
+    }
+
+    foreach ($t in $candidates) {
+        if ($t -eq $Serial) { continue }
+        Write-Stamp "试试当前端口：$t" DarkGray
+        if (Try-Connect -Target $t -Attempts 2 -Compact) { return $true }
+    }
+
+    return $false
+}
+
+
 # ---------------------------------------------------------------- 设备主流程
 <# 优先级：
      1. -Device 显式指定               -> 直接用
@@ -1022,6 +1137,19 @@ function Resolve-Device {
     # 1. 命令行显式指定
     if ($Explicit) {
         Write-Stamp "使用 -Device 指定的设备：$Explicit" Green
+
+        # 显式指定的设备也可能已经离线（上次那条无线连接掉了 / USB 被拔了）。
+        # 这时候不说一声就直接往后走，最后只会卡在"拿不到分辨率"，很难懂。
+        $match = @(Get-DeviceList | Where-Object { $_.Serial -eq $Explicit })
+        if ($match.Count -gt 0 -and $match[0].State -ne 'device') {
+            $state = $match[0].State
+            if ($state -eq 'offline' -and (Confirm-Reconnect -Serial $Explicit -State $state)) {
+                if (Repair-Device -Serial $Explicit) { return $Explicit }
+                Write-Stamp "$Explicit 没能自动连回来。" Yellow
+            } elseif ($state -ne 'offline') {
+                Write-Host "  它现在的状态是「$(Get-StateText $state)」，还不能调试。" -ForegroundColor Yellow
+            }
+        }
         return $Explicit
     }
 
@@ -1044,97 +1172,111 @@ function Resolve-Device {
         $online  = @($all | Where-Object { $_.State -eq 'device' })
         $pending = @($all | Where-Object { $_.State -ne 'device' })
 
-        if ($online.Count -gt 0) {
+        # 一台都不在线、也没有离线的 -> 没得选，只能走新设备流程
+        if ($online.Count -eq 0 -and $pending.Count -eq 0) {
+            Write-Host ""
+            Write-Host "adb 里没有在线的设备，走一遍连接流程。" -ForegroundColor DarkGray
+            return (Connect-NewDevice)
+        }
 
-            # 非交互环境（管道调用等）没法画菜单，只能退化成"能用就用"
-            if (-not (Test-Interactive)) {
-                if ($online.Count -eq 1) {
-                    Write-Stamp "（非交互环境）使用唯一在线设备：$($online[0].Serial)" Green
-                    return $online[0].Serial
-                }
-                Write-Host "非交互环境里有多台设备，请用 -Device 指定。" -ForegroundColor Red
-                $online | ForEach-Object { Write-Host "    $($_.Serial)" -ForegroundColor DarkGray }
+        # 非交互环境（管道调用等）没法画菜单，只能退化成"能用就用"
+        if (-not (Test-Interactive)) {
+            if ($online.Count -eq 1) {
+                Write-Stamp "（非交互环境）使用唯一在线设备：$($online[0].Serial)" Green
+                return $online[0].Serial
+            }
+            if ($online.Count -eq 0) {
+                Write-Host "非交互环境里没法问你要不要重连，请用 -Device 指定，或先手动 adb connect。" -ForegroundColor Red
+                $pending | ForEach-Object { Write-Host "    $($_.Serial)  $(Get-StateText $_.State)" -ForegroundColor DarkGray }
+                return ''
+            }
+            Write-Host "非交互环境里有多台设备，请用 -Device 指定。" -ForegroundColor Red
+            $online | ForEach-Object { Write-Host "    $($_.Serial)" -ForegroundColor DarkGray }
+            return ''
+        }
+
+        # 组菜单项：在线的直接选；离线 / 未授权的也列出来，选中就地问要不要重连
+        $items  = New-Object System.Collections.Generic.List[string]
+        $values = New-Object System.Collections.Generic.List[string]
+
+        foreach ($d in $online) {
+            $tail = $d.Model
+            if (-not $tail) { $tail = Get-StateText $d.State }
+            $kind = Get-LinkKind $d.Serial
+            $items.Add($d.Serial.PadRight(30) + $tail + "  ($kind)")
+            $values.Add($d.Serial)
+        }
+
+        foreach ($d in $pending) {
+            $kind  = Get-LinkKind $d.Serial
+            $state = Get-StateText $d.State
+            $items.Add($d.Serial.PadRight(30) + $state + "  ($kind)  ← 回车处理")
+            $values.Add("__pending__$($d.Serial)|$($d.State)")
+        }
+
+        $items.Add('连接新设备…')
+        $values.Add('__new__')
+
+        Write-Host ""
+
+        while ($true) {
+
+            if ($online.Count -gt 0) {
+                $title = "检测到 $($online.Count) 台可用设备"
+            } else {
+                $title = "没有在线的设备，有 $($pending.Count) 台离线 / 异常"
+            }
+            $parts = @()
+            $usbCount  = @($online | Where-Object { (Get-LinkKind $_.Serial) -eq 'USB' }).Count
+            $wifiCount = @($online | Where-Object { (Get-LinkKind $_.Serial) -eq '无线' }).Count
+            if ($usbCount  -gt 0) { $parts += "USB $usbCount" }
+            if ($wifiCount -gt 0) { $parts += "无线 $wifiCount" }
+            if ($parts.Count -gt 0) { $title += "（" + ($parts -join ' / ') + "）" }
+            $title += "，请选择："
+
+            $idx = Read-MenuChoice -Items $items.ToArray() -Title $title
+
+            if ($idx -lt 0) {
+                Write-Host "已取消。" -ForegroundColor DarkGray
                 return ''
             }
 
-            # 组菜单项
-            $items  = New-Object System.Collections.Generic.List[string]
-            $values = New-Object System.Collections.Generic.List[string]
+            $choice = $values[$idx]
 
-            foreach ($d in $online) {
-                $tail = $d.Model
-                if (-not $tail) { $tail = Get-StateText $d.State }
-                $kind = Get-LinkKind $d.Serial
-                $items.Add($d.Serial.PadRight(30) + $tail + "  ($kind)")
-                $values.Add($d.Serial)
-            }
+            if ($choice -eq '__new__') { break }
 
-            # 离线 / 未授权的也列出来，但选不中（选了只给提示）
-            foreach ($d in $pending) {
-                $kind  = Get-LinkKind $d.Serial
-                $label = $d.Serial.PadRight(30) + (Get-StateText $d.State) + "  ($kind)"
-                $items.Add($label)
-                $values.Add("__pending__$($d.Serial)|$($d.State)")
-            }
+            if ($choice -match '^__pending__(.+)\|(.+)$') {
 
-            $items.Add('连接新设备…')
-            $values.Add('__new__')
+                $serial = $Matches[1]
+                $state  = $Matches[2]
 
-            Write-Host ""
-
-            while ($true) {
-
-                $title = "检测到 $($online.Count) 台可用设备"
-                $parts = @()
-                $usbCount  = @($online | Where-Object { (Get-LinkKind $_.Serial) -eq 'USB' }).Count
-                $wifiCount = @($online | Where-Object { (Get-LinkKind $_.Serial) -eq '无线' }).Count
-                if ($usbCount  -gt 0) { $parts += "USB $usbCount" }
-                if ($wifiCount -gt 0) { $parts += "无线 $wifiCount" }
-                if ($parts.Count -gt 0) { $title += "（" + ($parts -join ' / ') + "）" }
-                $title += "，请选择：\"
-                $idx = Read-MenuChoice -Items $items.ToArray() -Title $title
-
-                if ($idx -lt 0) {
-                    Write-Host "已取消。" -ForegroundColor DarkGray
-                    return ''
-                }
-
-                $choice = $values[$idx]
-
-                if ($choice -eq '__new__') { break }
-
-                if ($choice -match '^__pending__(.+)\|(.+)$') {
-                    $serial = $Matches[1]
-                    $state  = $Matches[2]
-                    Write-Host ""
-                    Write-Host "  $serial 当前状态是「$(Get-StateText $state)」，还不能用。" -ForegroundColor Yellow
-                    if ($state -eq 'unauthorized') {
-                        Write-Host "  去手机上点『允许调试』（建议勾选『一律允许』），然后再选一次。" -ForegroundColor DarkGray
+                if ($state -eq 'offline') {
+                    # 离线：明确提示 + 问要不要重连；救活了就直接用它
+                    if (Confirm-Reconnect -Serial $serial -State $state) {
+                        if (Repair-Device -Serial $serial) { return $serial }
+                        Write-Host ""
+                        Write-Stamp "$serial 没能自动连回来。" Yellow
+                        Write-Host "  常见原因：手机没回到这个 Wi-Fi / 无线调试关了 / IP 被 DHCP 换了。" -ForegroundColor DarkGray
+                        Write-Host "  可以再选一次重试，或选『连接新设备…』手动输地址 / 重新配对。" -ForegroundColor DarkGray
+                        Write-Host ""
                     } else {
-                        Write-Host "  先让它回到 device 状态（重插 USB / 重开无线调试），然后再选一次。" -ForegroundColor DarkGray
+                        Write-Host "  已跳过这台。" -ForegroundColor DarkGray
                     }
-                    Write-Host ""
                     continue
                 }
 
-                return $choice
-            }
-        }
-        else {
-            Write-Host ""
-            if ($pending.Count -gt 0) {
-                # 常见情形：线插上了但手机还没点"允许 USB 调试"，或者无线那条掉线了。
-                # 这时候不该直接把人推去配对，先告诉他这些设备为什么用不了。
-                Write-Host "adb 里看到了设备，但状态还不允许调试：" -ForegroundColor Yellow
-                foreach ($d in $pending) {
-                    $kind = Get-LinkKind $d.Serial
-                    Write-Host "    $($d.Serial)  $(Get-StateText $d.State)  ($kind)" -ForegroundColor DarkGray
+                Write-Host ""
+                Write-Host "  $serial 当前状态是「$(Get-StateText $state)」，还不能用。" -ForegroundColor Yellow
+                if ($state -eq 'unauthorized') {
+                    Write-Host "  去手机上点『允许调试』（建议勾选『一律允许』），然后再选一次。" -ForegroundColor DarkGray
+                } else {
+                    Write-Host "  先让它回到 device 状态（重插 USB / 重开无线调试），然后再选一次。" -ForegroundColor DarkGray
                 }
-                Write-Host "  插线的：在手机弹窗里点『允许 USB 调试』（勾上『一律允许』），然后重跑脚本。" -ForegroundColor DarkGray
-                Write-Host "  接着往下走无线连接流程也可以。" -ForegroundColor DarkGray
-            } else {
-                Write-Host "adb 里没有在线的设备，走一遍连接流程。" -ForegroundColor DarkGray
+                Write-Host ""
+                continue
             }
+
+            return $choice
         }
     }
 
@@ -1219,6 +1361,7 @@ $script:SwipeDown = 0
 $script:TapCount  = 0
 $script:SwipeFail = 0
 $script:StatsRow  = -1        # 统计行所在的缓冲行号；-1 = 还没画过
+$script:OfflineWarned = $false # 运行期掉线只提示一次，别每按一次刷一行
 
 <# --------------------------------------------------------- 统计行
 
@@ -1286,6 +1429,19 @@ function Write-StatsSummary {
     Write-Stamp $line Cyan
 }
 
+<# 动作失败时顺手看一眼设备还在不在线。
+   在的话什么都不说（可能只是这条命令失败）；不在线就说一句，
+   并且只在【第一次掉线】时提示，免得按住键连按时刷满屏。 #>
+function Show-OfflineHint {
+    if ($script:OfflineWarned) { return }
+    if (Test-DeviceOnline -Address $Device) { return }
+
+    $script:OfflineWarned = $true
+    Write-Stamp "设备已经离线（$Device），手势现在发不出去。" Yellow
+    Write-Host "  关掉窗口重跑脚本，菜单里选中它就会问你要不要重新连接。" -ForegroundColor DarkGray
+    Write-Host "  或者插上 USB 线继续按快捷键（有线掉线概率低得多）。" -ForegroundColor DarkGray
+}
+
 <# 一次滑动。
    成功时【不新增任何输出行】—— 只把最后那一行的计数改写一遍。
    只有失败才吭一声：打印前先让出统计行，打完再把统计行贴回最后一行。 #>
@@ -1307,10 +1463,12 @@ function Invoke-Swipe {
         Reset-StatsLine
         Write-Stamp "$arrow 滑动失败（adb 返回 $code）" Yellow
         Write-AdbRaw -Arguments $arguments -StdOut $stdout -ExitCode $code
+        Show-OfflineHint
         Show-Stats
         return
     }
 
+    $script:OfflineWarned = $false
     if ($Direction -eq 'Up') {
         $script:SwipeUp = $script:SwipeUp + 1
     } else {
@@ -1332,10 +1490,12 @@ function Invoke-Tap {
         Reset-StatsLine
         Write-Stamp "· 点按失败（adb 返回 $code）" Yellow
         Write-AdbRaw -Arguments $arguments -StdOut $stdout -ExitCode $code
+        Show-OfflineHint
         Show-Stats
         return
     }
 
+    $script:OfflineWarned = $false
     $script:TapCount = $script:TapCount + 1
     Show-Stats
 }

@@ -1,7 +1,7 @@
 ﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
-    交互式连接设备，然后监听 Shift+↑ / Shift+↓ / Shift+空格，
+    交互式连接设备，然后监听 Alt+F1 / Alt+F2 / Alt+F3（可用参数改），
     向 adb 设备发送「上滑 / 下滑 / 屏幕正中点按」手势。
 
 .DESCRIPTION
@@ -26,10 +26,25 @@
           IP 输入框预填了 "192.168"（内网基本都是这个开头），接着往下敲就行。
 
       [3] 连上之后才开始监听键盘：
-          Shift + ↑     上滑（手指从屏幕下方划到上方 -> 内容往上滚）
-          Shift + ↓     下滑（手指从屏幕上方划到下方 -> 内容往下滚）
-          Shift + 空格  点按屏幕正中（相当于在屏幕中央轻点一下）
+          Alt + F1   上滑（手指从屏幕下方划到上方 -> 内容往上滚）
+          Alt + F2   下滑（手指从屏幕上方划到下方 -> 内容往下滚）
+          Alt + F3   点按屏幕正中（相当于在屏幕中央轻点一下）
           按住不放会连续滑动（一次滑动做完就补发下一次）。
+
+          F1/F2/F3 在最上面连成一排，从左到右正好是 上滑 / 下滑 / 点按，
+          不用记；Alt 用大拇指按，剩下的手指就搭在 F1~F3 上，左手一只就够。
+
+          为什么是 Alt 而不是 `（1 左边那个键）：Windows 的全局热键 API
+          （RegisterHotKey）只认 Ctrl / Alt / Shift / Win 四个修饰键，
+          ` 根本不能当修饰键用 —— 那是系统层面的硬限制，不是脚本偷懒。
+          想真按 ` + F1，必须换成低级键盘钩子自己拦，` 会被整机吞掉，
+          在编辑器里打反引号都受影响，不值当。Alt 是大拇指，位置差不多。
+
+          为什么不用光秃秃的 F1/F2/F3：那三个在常用的软件里都是有主人的
+          （F1 帮助、F2 重命名、F3 搜索），全局抢走会很难受。
+          加上 Alt 之后，它们在常用软件里基本没人用（Alt+F4 是关窗口，避开）。
+
+          启动时会逐个实测注册，真撞车了会当场点名是哪个键，并给出换法。
 
           每次动作【不新增任何输出行】：只把输出最后那一行的计数改写一遍
           （上滑 / 下滑 / 点按 次数原地刷新），所以按多少次屏幕都不会被刷满。
@@ -39,9 +54,12 @@
     手机重开了无线调试也能自己找到新端口。
 
     默认是【全局热键】：脚本窗口不在前台也照样触发，方便你盯着手机屏幕操作。
-    代价是脚本运行期间，Shift+↑ / Shift+↓ / Shift+空格 在整个系统都被本脚本吃掉
-    （包括文本编辑器里的「选中到行首/行尾」，以及中文输入法的全角/半角切换）。
-    不想影响其它软件就加 -ConsoleOnly：只在这个控制台窗口有焦点时生效。
+    按下去的组合在整个系统都会被本脚本吃掉 —— 所以默认挑了 Alt+F1~F3 这组
+    没人用的（Alt 系列里只有 Alt+F4 是关窗口，特意避开了）。
+    如果在你机器上仍然撞车（启动时会明确告诉你哪个键注册失败），换掉就行：
+        -UpKey 'Ctrl+Alt+F7' -DownKey 'Ctrl+Alt+F8' -TapKey 'Ctrl+Alt+F9'
+    键位写法见 -UpKey 参数说明；想完全不全局劫持就加 -ConsoleOnly，
+    只在这个控制台窗口有焦点时生效。
 
     停止监听：关掉窗口，或者按 Ctrl+C。
     进程一结束，热键由系统自动释放，不会留下幽灵监听。
@@ -58,7 +76,10 @@
 .EXAMPLE
     .\start-watchV.cmd -Device 192.168.1.100:5555 -Duration 250
 .EXAMPLE
-    .\start-watchV.cmd -ConsoleOnly          # 只监听本窗口，不抢系统热键
+    .\start-watchV.cmd -ConsoleOnly          # 只监听本窗口，不做全局热键
+.EXAMPLE
+    .\start-watchV.cmd -UpKey 'Ctrl+Alt+F7' -DownKey 'Ctrl+Alt+F8' -TapKey 'Ctrl+Alt+F9'
+                                             # 默认那三个键在你机器上撞车时，换成这组
 #>
 [CmdletBinding()]
 param(
@@ -79,7 +100,21 @@ param(
     [ValidateRange(0.05, 0.95)]
     [double]$FarRatio = 0.2,
 
-    # 只监听本控制台窗口，不抢系统的 Shift+↑ / Shift+↓ / Shift+空格
+    # 三个快捷键。<修饰键>+<主键> 的写法，大小写随意、修饰键顺序随意。
+    #   修饰键：Ctrl / Control / Alt / Shift / Win（可叠加）
+    #   主键  ：A~Z、0~9、F1~F24、Up/Down/Left/Right、Space、Tab、Esc、Enter、
+    #           Insert、Delete、Home、End、PageUp、PageDown、Pause、ScrollLock、
+    #           ` ~ - = [ ] \ ; ' , . /
+    # 默认用 Alt+F1/F2/F3：F 键排一排、从左到右 = 上滑/下滑/点按，
+    # Alt 大拇指一压就行；这组在常用软件里没人占。
+    # 注意：修饰键只能是 Ctrl / Alt / Shift / Win —— ` 之类的键当不了修饰键。
+    [string]$UpKey   = 'Alt+F1',
+
+    [string]$DownKey = 'Alt+F2',
+
+    [string]$TapKey  = 'Alt+F3',
+
+    # 只监听本控制台窗口，不做全局热键
     [switch]$ConsoleOnly
 )
 
@@ -107,6 +142,143 @@ function Test-Interactive {
     } catch {
         return $false
     }
+}
+
+
+<# 把 "Ctrl+Alt+Q" / "Alt+`" / "F7" 这种写法，解析成
+   RegisterHotKey 要的 (修饰键掩码, 虚拟键码)，外加 -ConsoleOnly 模式要比对的 ConsoleKey 名。
+
+   为什么要参数化：快捷键没法一套通吃。Shift+↑ 在编辑器里是「向上选中」，
+   全局占掉会让人没法用；换个组合又可能撞上微信（Ctrl+Alt+W）、QQ（Ctrl+Alt+A）、
+   JetBrains（Ctrl+Alt+S / Ctrl+Alt+F7）之类。所以默认给一组冷门的，
+   注册失败时明确报出来，再给参数让人自己换。
+
+   MOD_ALT=1  MOD_CONTROL=2  MOD_SHIFT=4  MOD_WIN=8（winuser.h 的原值）。 #>
+function ConvertTo-HotKeySpec {
+    param([string]$Text)
+
+    if (-not $Text) { return $null }
+    $raw = $Text.Trim()
+    if (-not $raw) { return $null }
+
+    $parts = @($raw -split '\+')
+    if ($parts.Count -lt 1) { return $null }
+
+    $keyName = $parts[$parts.Count - 1].Trim()
+    if (-not $keyName) { return $null }
+
+    $mods = 0
+    for ($i = 0; $i -lt $parts.Count - 1; $i++) {
+        switch ($parts[$i].Trim().ToLowerInvariant()) {
+            'ctrl'    { $mods = $mods -bor 0x0002 }
+            'control' { $mods = $mods -bor 0x0002 }
+            'alt'     { $mods = $mods -bor 0x0001 }
+            'shift'   { $mods = $mods -bor 0x0004 }
+            'win'     { $mods = $mods -bor 0x0008 }
+            default   { return $null }
+        }
+    }
+
+    # 名称 -> @(虚拟键码, ConsoleKey 名)
+    $map = @{
+        'space'      = @(0x20, 'Spacebar')
+        'spacebar'   = @(0x20, 'Spacebar')
+        'tab'        = @(0x09, 'Tab')
+        'esc'        = @(0x1B, 'Escape')
+        'escape'     = @(0x1B, 'Escape')
+        'enter'      = @(0x0D, 'Enter')
+        'return'     = @(0x0D, 'Enter')
+        'backspace'  = @(0x08, 'Backspace')
+        'insert'     = @(0x2D, 'Insert')
+        'ins'        = @(0x2D, 'Insert')
+        'delete'     = @(0x2E, 'Delete')
+        'del'        = @(0x2E, 'Delete')
+        'home'       = @(0x24, 'Home')
+        'end'        = @(0x23, 'End')
+        'pageup'     = @(0x21, 'PageUp')
+        'pgup'       = @(0x21, 'PageUp')
+        'pagedown'   = @(0x22, 'PageDown')
+        'pgdn'       = @(0x22, 'PageDown')
+        'up'         = @(0x26, 'UpArrow')
+        'down'       = @(0x28, 'DownArrow')
+        'left'       = @(0x25, 'LeftArrow')
+        'right'      = @(0x27, 'RightArrow')
+        'pause'      = @(0x13, 'Pause')
+        'scrolllock' = @(0x91, 'Scroll')
+        'scroll'     = @(0x91, 'Scroll')
+        '`'          = @(0xC0, 'Oem3')
+        '~'          = @(0xC0, 'Oem3')
+        '-'          = @(0xBD, 'OemMinus')
+        '='          = @(0xBB, 'OemPlus')
+        '['          = @(0xDB, 'OemOpenBrackets')
+        ']'          = @(0xDD, 'OemCloseBrackets')
+        '\'         = @(0xDC, 'OemPipe')
+        ';'          = @(0xBA, 'OemSemicolon')
+        "'"          = @(0xDE, 'OemQuotes')
+        ','          = @(0xBC, 'OemComma')
+        '.'          = @(0xBE, 'OemPeriod')
+        '/'          = @(0xBF, 'OemQuestion')
+    }
+
+    $vk          = $null
+    $consoleName = $null
+    $displayKey  = $keyName
+
+    $low = $keyName.ToLowerInvariant()
+    if ($map.ContainsKey($low)) {
+        $vk          = [int]$map[$low][0]
+        $consoleName = [string]$map[$low][1]
+    } elseif ($keyName -match '^[A-Za-z]$') {
+        $displayKey  = $keyName.ToUpperInvariant()
+        $vk          = [int][char]$displayKey
+        $consoleName = $displayKey
+    } elseif ($keyName -match '^[0-9]$') {
+        $vk          = 0x30 + [int]$keyName
+        $consoleName = 'D' + $keyName
+    } elseif ($keyName -match '^[Ff]([0-9]{1,2})$') {
+        $n = [int]$Matches[1]
+        if ($n -lt 1 -or $n -gt 24) { return $null }
+        $vk          = 0x6F + $n
+        $displayKey  = 'F' + $n
+        $consoleName = $displayKey
+    } else {
+        return $null
+    }
+
+    $label = @()
+    if ($mods -band 0x0002) { $label += 'Ctrl' }
+    if ($mods -band 0x0001) { $label += 'Alt' }
+    if ($mods -band 0x0004) { $label += 'Shift' }
+    if ($mods -band 0x0008) { $label += 'Win' }
+    $label += $displayKey
+
+    return [pscustomobject]@{
+        Modifiers  = $mods
+        VK         = $vk
+        ConsoleKey = $consoleName
+        Text       = ($label -join '+')
+    }
+}
+
+<# -ConsoleOnly 模式下拿 ReadKey 的结果比对热键。
+   ConsoleModifiers 里没有 Win 键 —— 带 Win 的组合在这里认不出来，调用方会提前拒绝。 #>
+function Test-ConsoleHotKey {
+    param(
+        [System.ConsoleKeyInfo]$Key,
+        [object]$Spec
+    )
+
+    if (-not $Spec) { return $false }
+    if ($Spec.Modifiers -band 0x0008) { return $false }
+
+    $want = 0
+    if ($Spec.Modifiers -band 0x0002) { $want = $want -bor [int][System.ConsoleModifiers]::Control }
+    if ($Spec.Modifiers -band 0x0001) { $want = $want -bor [int][System.ConsoleModifiers]::Alt }
+    if ($Spec.Modifiers -band 0x0004) { $want = $want -bor [int][System.ConsoleModifiers]::Shift }
+
+    # 修饰键必须完全一致：多按一个 Shift 就不算同一个热键（和全局模式的行为对齐）
+    if (([int]$Key.Modifiers -band 0x7) -ne $want) { return $false }
+    return ($Key.Key.ToString() -eq $Spec.ConsoleKey)
 }
 
 
@@ -1307,7 +1479,7 @@ if (-not $script:AdbExe) {
 
 # ---------------------------------------------------------------- 1. 拿到设备
 Write-Host ""
-Write-Host "adb 滑动热键 | Shift+↑ 上滑   Shift+↓ 下滑" -ForegroundColor Cyan
+Write-Host "adb 滑动热键 | $UpKey 上滑   $DownKey 下滑   $TapKey 点按" -ForegroundColor Cyan
 
 if ($script:AdbExe.ToLowerInvariant().StartsWith($scriptDir.ToLowerInvariant())) {
     Write-Stamp "adb：$script:AdbExe  (脚本自带)" Green
@@ -1501,6 +1673,29 @@ function Invoke-Tap {
 }
 
 
+# ---------------------------------------------------------------- 3.5 解析热键
+# 三个键都能用参数换。写错就当场退出，别等到监听时才发现某个键根本没注册上。
+$specUp   = ConvertTo-HotKeySpec -Text $UpKey
+$specDown = ConvertTo-HotKeySpec -Text $DownKey
+$specTap  = ConvertTo-HotKeySpec -Text $TapKey
+
+foreach ($pair in @(
+    [pscustomobject]@{ Name = '-UpKey';   Raw = $UpKey;   Spec = $specUp },
+    [pscustomobject]@{ Name = '-DownKey'; Raw = $DownKey; Spec = $specDown },
+    [pscustomobject]@{ Name = '-TapKey';  Raw = $TapKey;  Spec = $specTap }
+)) {
+    if (-not $pair.Spec) {
+        Write-Host ""
+        Write-Host "热键写法看不懂：$($pair.Name) '$($pair.Raw)'" -ForegroundColor Red
+        Write-Host "  格式：修饰键+主键，例如 'Ctrl+Alt+Q'、'Alt+``'、'F7'、'Ctrl+Shift+F9'" -ForegroundColor DarkGray
+        Write-Host "  修饰键：Ctrl / Alt / Shift / Win（可叠加，顺序随意）" -ForegroundColor DarkGray
+        Write-Host "  主键  ：A~Z、0~9、F1~F24、Up/Down/Left/Right、Space、Tab、Esc、Enter、" -ForegroundColor DarkGray
+        Write-Host "          Insert、Delete、Home、End、PageUp、PageDown、Pause、ScrollLock、`` 等" -ForegroundColor DarkGray
+        exit 1
+    }
+}
+
+
 # ---------------------------------------------------------------- 4. 打印一下配置
 Write-Host ""
 Write-Host "wm size 原始输出：" -ForegroundColor DarkGray
@@ -1508,6 +1703,7 @@ $sizeOutput | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
 Write-Host ""
 Write-Host "设备    : $Device"
 Write-Host "分辨率  : ${W}x${H}"
+Write-Host "热键    : $($specUp.Text) 上滑   $($specDown.Text) 下滑   $($specTap.Text) 点按"
 Write-Host "上滑    : ($X, $Ynear) -> ($X, $Yfar)  ${Duration}ms"
 Write-Host "下滑    : ($X, $Yfar)  -> ($X, $Ynear)  ${Duration}ms"
 Write-Host "点按    : ($X, $Ymid)"
@@ -1552,10 +1748,10 @@ public static class HotKeyNative
     private static extern bool PeekMessage(out MSG lpMsg, IntPtr hWnd,
                                            uint wMsgFilterMin, uint wMsgFilterMax, uint wRemoveMsg);
 
-    // 注册 Shift+<vk>，失败返回 false
-    public static bool RegisterShiftHotKey(int id, uint vk)
+    // 注册 <modifiers>+<vk>，失败返回 false（多半是这个组合已经被别的程序占着）
+    public static bool RegisterCombo(int id, uint modifiers, uint vk)
     {
-        return RegisterHotKey(IntPtr.Zero, id, MOD_SHIFT, vk);
+        return RegisterHotKey(IntPtr.Zero, id, modifiers, vk);
     }
 
     public static void UnregisterHotKeyById(int id)
@@ -1592,19 +1788,38 @@ public static class HotKeyNative
     $idDown = 2
     $idTap  = 3
 
-    $okUp   = [HotKeyNative]::RegisterShiftHotKey($idUp,   [HotKeyNative]::VK_UP)
-    $okDown = [HotKeyNative]::RegisterShiftHotKey($idDown, [HotKeyNative]::VK_DOWN)
-    $okTap  = [HotKeyNative]::RegisterShiftHotKey($idTap,  [HotKeyNative]::VK_SPACE)
+    $okUp   = [HotKeyNative]::RegisterCombo($idUp,   $specUp.Modifiers,   $specUp.VK)
+    $okDown = [HotKeyNative]::RegisterCombo($idDown, $specDown.Modifiers, $specDown.VK)
+    $okTap  = [HotKeyNative]::RegisterCombo($idTap,  $specTap.Modifiers,  $specTap.VK)
 
-    if (-not $okUp)   { Write-Stamp "Shift+↑ 注册失败（可能被别的程序占着）" Yellow }
-    if (-not $okDown) { Write-Stamp "Shift+↓ 注册失败（可能被别的程序占着）" Yellow }
-    if (-not $okTap)  { Write-Stamp "Shift+空格 注册失败（多半是中文输入法占着全角/半角切换）" Yellow }
+    if (-not $okUp) {
+        Write-Stamp "$($specUp.Text) 注册失败：这个组合已经被别的程序占用了。" Yellow
+        Write-Host "    换一个：start-watchV.cmd -UpKey 'Ctrl+Alt+F7'" -ForegroundColor DarkGray
+    }
+    if (-not $okDown) {
+        Write-Stamp "$($specDown.Text) 注册失败：这个组合已经被别的程序占用了。" Yellow
+        Write-Host "    换一个：start-watchV.cmd -DownKey 'Ctrl+Alt+F8'" -ForegroundColor DarkGray
+    }
+    if (-not $okTap) {
+        Write-Stamp "$($specTap.Text) 注册失败：这个组合已经被别的程序占用了。" Yellow
+        Write-Host "    换一个：start-watchV.cmd -TapKey 'Ctrl+Alt+F9'" -ForegroundColor DarkGray
+    }
     if (-not $okUp -and -not $okDown -and -not $okTap) {
         Write-Host "三个热键都没注册上，监听没意义，退出。" -ForegroundColor Red
+        Write-Host "换一组更冷门的试试：Ctrl+Alt+F7 / Ctrl+Alt+F8 / Ctrl+Alt+F9。" -ForegroundColor DarkGray
+        Write-Host "（如果连这组也失败，多半是安全软件在拦 RegisterHotKey。）" -ForegroundColor DarkGray
         exit 1
     }
 
-    Write-Host "正在(全局)监听 Shift+↑ 上滑 / Shift+↓ 下滑 / Shift+空格 点按 ... 关窗口或 Ctrl+C 停止" -ForegroundColor Green
+    Write-Host "正在(全局)监听 $($specUp.Text) 上滑 / $($specDown.Text) 下滑 / $($specTap.Text) 点按 ... 关窗口或 Ctrl+C 停止" -ForegroundColor Green
+
+    # 单个键（没有修饰键）会被整机接管，别的软件里就按不到了 —— 说一次，别让人莫名其妙
+    $bareKeys = @($specUp, $specDown, $specTap | Where-Object { $_.Modifiers -eq 0 } | ForEach-Object { $_.Text })
+    if ($bareKeys.Count -gt 0) {
+        Write-Host ("    提醒：{0} 是单个键，脚本运行期间会被全局接管，别的软件里按不到它们。" -f ($bareKeys -join ' / ')) -ForegroundColor DarkGray
+        Write-Host "    想还给别的软件：加修饰键，例如 -UpKey 'Ctrl+Alt+F7' -DownKey 'Ctrl+Alt+F8' -TapKey 'Ctrl+Alt+F9'" -ForegroundColor DarkGray
+    }
+
     Show-Stats                      # 先把统计行立起来（0 / 0）
 
     try {
@@ -1633,18 +1848,21 @@ public static class HotKeyNative
 # ================================================================ 模式 B：只监听本窗口
 else {
 
-    Write-Host "正在(本窗口)监听 Shift+↑ 上滑 / Shift+↓ 下滑 / Shift+空格 点按 ... 保持窗口为当前焦点，Ctrl+C 停止" -ForegroundColor Green
+    Write-Host "正在(本窗口)监听 $($specUp.Text) 上滑 / $($specDown.Text) 下滑 / $($specTap.Text) 点按 ... 保持窗口为当前焦点，Ctrl+C 停止" -ForegroundColor Green
+
+    # ReadKey 看不到 Win 键，带 Win 的组合在这个模式下永远匹配不上，提前说清楚
+    if ((($specUp.Modifiers -bor $specDown.Modifiers -bor $specTap.Modifiers) -band 0x0008) -ne 0) {
+        Write-Stamp "带 Win 键的组合在 -ConsoleOnly 模式下认不出来，请换键或去掉 -ConsoleOnly。" Yellow
+    }
     Show-Stats                      # 先把统计行立起来（0 / 0）
 
     try {
         while ($true) {
             $key = [Console]::ReadKey($true)
 
-            if (($key.Modifiers -band [ConsoleModifiers]::Shift) -eq 0) { continue }
-
-            if     ($key.Key -eq [ConsoleKey]::UpArrow)   { Invoke-Swipe -Direction Up }
-            elseif ($key.Key -eq [ConsoleKey]::DownArrow) { Invoke-Swipe -Direction Down }
-            elseif ($key.Key -eq [ConsoleKey]::Spacebar)  { Invoke-Tap }
+            if     (Test-ConsoleHotKey -Key $key -Spec $specUp)   { Invoke-Swipe -Direction Up }
+            elseif (Test-ConsoleHotKey -Key $key -Spec $specDown) { Invoke-Swipe -Direction Down }
+            elseif (Test-ConsoleHotKey -Key $key -Spec $specTap)  { Invoke-Tap }
         }
     } finally {
         Reset-StatsLine

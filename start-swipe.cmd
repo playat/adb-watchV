@@ -3,7 +3,11 @@ setlocal
 title adb watchV hotkey
 
 rem =====================================================================
-rem  Double-click this file to start the Shift+Up / Shift+Down swiper.
+rem  Double-click this file to start the watcher (Alt+F1 / Alt+F2 / Alt+F3).
+rem
+rem  While its window has focus, pressing "r" disconnects the device and
+rem  restarts the script. That key is NOT a global hotkey: the script only
+rem  reads its own console buffer, so other apps keep their "r".
 rem
 rem  It first lists the devices already in adb and lets you pick one
 rem  with the arrow keys (the last entry is "connect a new device").
@@ -31,9 +35,24 @@ if not exist "%SCRIPT%" (
     exit /b 1
 )
 
+rem Marks "we are launched by this launcher" so the script can hand the
+rem restart back to us (see Restart-Watcher in the .ps1).
+set "ADBWATCH_LAUNCHER=1"
+
+:run
 powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%" %*
 
 set "RC=%ERRORLEVEL%"
+
+rem 97 = the script asked for a restart (pressed "r" in its window).
+rem We stay alive and run it again, so the window and its history survive.
+if "%RC%"=="97" (
+    echo.
+    echo [restart] restarting the watcher...
+    echo ------------------------------------------------------------
+    goto run
+)
+
 if not "%RC%"=="0" (
     echo.
     echo [ERROR] script exited with code %RC%. Window kept open so you can read the message.

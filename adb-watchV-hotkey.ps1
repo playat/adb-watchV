@@ -46,6 +46,10 @@
 
           启动时会逐个实测注册，真撞车了会当场点名是哪个键，并给出换法。
 
+          窗口被聚焦时按 r：断开当前设备、然后重启脚本（等于重来一遍）。
+          它读的是本窗口的键盘缓冲区，窗口没焦点就收不到 —— 不是全局热键，
+          不会跟别的软件抢 r 这个字母。
+
           每次动作【不新增任何输出行】：只把输出最后那一行的计数改写一遍
           （上滑 / 下滑 / 点按 次数原地刷新），所以按多少次屏幕都不会被刷满。
           Ctrl+C 或关窗口停止时，再给一行合计。
@@ -1534,6 +1538,7 @@ $script:TapCount  = 0
 $script:SwipeFail = 0
 $script:StatsRow  = -1        # 统计行所在的缓冲行号；-1 = 还没画过
 $script:OfflineWarned = $false # 运行期掉线只提示一次，别每按一次刷一行
+$script:Restarting   = $false # 是不是按了 r 在重启（决定收尾时说什么）
 
 <# --------------------------------------------------------- 统计行
 
@@ -1673,6 +1678,43 @@ function Invoke-Tap {
 }
 
 
+<# 窗口被聚焦时按 r：断开当前设备，然后把脚本整个重启一遍。
+
+   刻意【不做】全局热键 —— 这里读的是本控制台窗口的键盘缓冲区，
+   窗口没焦点就根本收不到按键，不会跟别的软件抢 r 这个字母。
+
+   重启的实现：本进程只负责断开 + 以 97 退出，真正的重启交给启动器
+   （start-swipe.cmd 收到 97 就原样再跑一遍）。这样不用自己生一个新进程，
+   也不会出现两个窗口同时抢同一副热键、或者新进程比旧窗口先死这种烂事。 #>
+function Restart-Watcher {
+    param([string]$Target)
+
+    $script:Restarting = $true
+    Reset-StatsLine                 # 先让出统计行，后面的消息按正常顺序往下打
+    Write-Host ""
+    Write-Stamp "按了 r：断开 $Target ..." Cyan
+
+    if ((Get-LinkKind $Target) -eq '无线') {
+        $null = Invoke-Adb @('disconnect', $Target) -TimeoutSec 8
+        if ($LASTEXITCODE -eq 0) {
+            Write-Stamp "已断开。" Green
+        } else {
+            Write-Stamp "断开没成功（可能本来就已经掉了），照样接着重启。" DarkGray
+        }
+    } else {
+        Write-Stamp "USB 设备没有「断开」这回事，直接重启脚本。" DarkGray
+    }
+
+    if ($env:ADBWATCH_LAUNCHER -eq '1') {
+        Write-Stamp "重启脚本 ..." Cyan
+        exit 97                      # 启动器看到 97 就再跑一遍
+    }
+
+    Write-Stamp "这个窗口不是 start-swipe.cmd 拉起来的，没法自动重启。" Yellow
+    Write-Stamp "关掉窗口重新双击 start-swipe.cmd 就行（设备已经断开了）。" Yellow
+    exit 0
+}
+
 # ---------------------------------------------------------------- 3.5 解析热键
 # 三个键都能用参数换。写错就当场退出，别等到监听时才发现某个键根本没注册上。
 $specUp   = ConvertTo-HotKeySpec -Text $UpKey
@@ -1811,13 +1853,20 @@ public static class HotKeyNative
         exit 1
     }
 
-    Write-Host "正在(全局)监听 $($specUp.Text) 上滑 / $($specDown.Text) 下滑 / $($specTap.Text) 点按 ... 关窗口或 Ctrl+C 停止" -ForegroundColor Green
+    Write-Host "正在(全局)监听 $($specUp.Text) 上滑 / $($specDown.Text) 下滑 / $($specTap.Text) 点按 ... 关窗口或 Ctrl+C 停止；窗口聚焦时按 r 断开并重启" -ForegroundColor Green
 
     # 单个键（没有修饰键）会被整机接管，别的软件里就按不到了 —— 说一次，别让人莫名其妙
     $bareKeys = @($specUp, $specDown, $specTap | Where-Object { $_.Modifiers -eq 0 } | ForEach-Object { $_.Text })
     if ($bareKeys.Count -gt 0) {
         Write-Host ("    提醒：{0} 是单个键，脚本运行期间会被全局接管，别的软件里按不到它们。" -f ($bareKeys -join ' / ')) -ForegroundColor DarkGray
         Write-Host "    想还给别的软件：加修饰键，例如 -UpKey 'Ctrl+Alt+F7' -DownKey 'Ctrl+Alt+F8' -TapKey 'Ctrl+Alt+F9'" -ForegroundColor DarkGray
+    }
+
+    # 能不能从控制台读按键（输入被重定向时 KeyAvailable 会抛异常）
+    $script:CanReadKeys = $false
+    try { $null = [Console]::KeyAvailable; $script:CanReadKeys = $true } catch { }
+    if (-not $script:CanReadKeys) {
+        Write-Host "  （这个窗口读不到按键，r 键重启不可用；要它可用就别用管道启动。）" -ForegroundColor DarkGray
     }
 
     Show-Stats                      # 先把统计行立起来（0 / 0）
@@ -1832,6 +1881,11 @@ public static class HotKeyNative
 
                 [HotKeyNative]::DrainHotKeys()
             } else {
+                # 窗口有焦点时按 r = 断开 + 重启。只读本窗口的键盘缓冲区，不是全局热键。
+                if ($script:CanReadKeys -and [Console]::KeyAvailable) {
+                    $k = [Console]::ReadKey($true)
+                    if ($k.Key -eq [ConsoleKey]::R) { Restart-Watcher -Target $Device }
+                }
                 Start-Sleep -Milliseconds 10
             }
         }
@@ -1841,14 +1895,18 @@ public static class HotKeyNative
         if ($okTap)  { [HotKeyNative]::UnregisterHotKeyById($idTap) }
         Reset-StatsLine             # 让出统计行，后面的消息按正常顺序继续往下打
         Write-Host ""
-        Write-Stamp "已停止监听，热键已释放。" Cyan
-        Write-StatsSummary
+        if ($script:Restarting) {
+            Write-Stamp "热键已释放，交给启动器重启。" Cyan
+        } else {
+            Write-Stamp "已停止监听，热键已释放。" Cyan
+            Write-StatsSummary
+        }
     }
 }
 # ================================================================ 模式 B：只监听本窗口
 else {
 
-    Write-Host "正在(本窗口)监听 $($specUp.Text) 上滑 / $($specDown.Text) 下滑 / $($specTap.Text) 点按 ... 保持窗口为当前焦点，Ctrl+C 停止" -ForegroundColor Green
+    Write-Host "正在(本窗口)监听 $($specUp.Text) 上滑 / $($specDown.Text) 下滑 / $($specTap.Text) 点按 ... 保持窗口为当前焦点，Ctrl+C 停止；按 r 断开并重启" -ForegroundColor Green
 
     # ReadKey 看不到 Win 键，带 Win 的组合在这个模式下永远匹配不上，提前说清楚
     if ((($specUp.Modifiers -bor $specDown.Modifiers -bor $specTap.Modifiers) -band 0x0008) -ne 0) {
@@ -1863,11 +1921,16 @@ else {
             if     (Test-ConsoleHotKey -Key $key -Spec $specUp)   { Invoke-Swipe -Direction Up }
             elseif (Test-ConsoleHotKey -Key $key -Spec $specDown) { Invoke-Swipe -Direction Down }
             elseif (Test-ConsoleHotKey -Key $key -Spec $specTap)  { Invoke-Tap }
+            elseif ($key.Key -eq [ConsoleKey]::R -and $key.Modifiers -eq 0) { Restart-Watcher -Target $Device }
         }
     } finally {
         Reset-StatsLine
         Write-Host ""
-        Write-Stamp "已停止监听。" Cyan
-        Write-StatsSummary
+        if ($script:Restarting) {
+            Write-Stamp "交给启动器重启。" Cyan
+        } else {
+            Write-Stamp "已停止监听。" Cyan
+            Write-StatsSummary
+        }
     }
 }

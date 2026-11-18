@@ -130,6 +130,16 @@ function Write-Stamp {
     Write-Host ("[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $Message) -ForegroundColor $Color
 }
 
+<# 终端可见宽度（留一格，避免写满最后一行时自动换行）。
+   放在这么靠前是因为扫描行/统计行都用它，而主流程比统计区先执行。 #>
+function Get-ConsoleWidth {
+    try {
+        $w = [Console]::WindowWidth
+        if ($w -gt 1) { return ($w - 1) }
+    } catch { }
+    return 79
+}
+
 <# 这个脚本要靠键盘交互（方向键菜单 + Read-Host）。
    如果 stdin/stdout 被重定向（比如 piped、被别的程序接管），
    [Console]::ReadKey 会直接抛异常，菜单也画不出来 —— 提前判断好降级。 #>
@@ -922,12 +932,19 @@ function Try-Connect {
 
     if (-not $Target) { return $false }
 
+    # 失败原因，给调用方判断"值不值得重试 / 该不该去配对"
+    #   port      = 端口没开（地址已过期，重试没用）
+    #   handshake = 端口通但 adb 握不上手（没配对 / 配对码过期）
+    #   timeout   = adb 自己卡死了
+    $script:LastConnectReason = 'bad'
+
     $hp = Parse-HostPort -Text $Target
     if (-not $hp) { return $false }
     $portNumber = 0
     [void][int]::TryParse($hp.Port, [ref]$portNumber)
 
     if (-not (Test-HostPortOpen -Address $hp.Host -Port $portNumber)) {
+        $script:LastConnectReason = 'port'
         # Compact 是扫描循环在调：每 2.5 秒报一次会刷屏，交给调用方统一说
         if (-not $Compact) { Write-Stamp "$Target 端口没开（没监听 / 端口已经变了）" Yellow }
         return $false
@@ -935,6 +952,7 @@ function Try-Connect {
 
     Invoke-Adb @('disconnect') -TimeoutSec 10 | Out-Null
 
+    $script:LastConnectReason = 'handshake'
     for ($i = 1; $i -le $Attempts; $i++) {
 
         if ($i -gt 1) {
@@ -973,6 +991,7 @@ function Try-Connect {
         }
 
         if ($script:adbTimedOut) {
+            $script:LastConnectReason = 'timeout'
             Write-Stamp "adb 20 秒没回应，这个地址多半是死的，不重试了。" Yellow
             break
         }
@@ -995,6 +1014,7 @@ function Try-Connect {
    所以流程第一件事是 kill-server 把 1、2 清干净，第二件事是重新发现端口，
    而不是拿上次那个端口反复硬连 —— 那只会一直卡在"连接中"。 #>
 function Connect-NewDevice {
+    param([switch]$PairOnly)      # 扫描阶段已经确认"端口通但连不上"，跳过手动输入直接配对
 
     if (-not (Test-Interactive)) {
         Write-Host "连接流程需要交互式终端。请用 -Device 指定设备，或双击 start-watchV.cmd。" -ForegroundColor Red
@@ -1015,45 +1035,54 @@ function Connect-NewDevice {
     $knownConnect = New-Object System.Collections.Generic.List[string]
     foreach ($a in @($script:KnownConnectAddrs)) { $knownConnect.Add($a) }
 
-    # ============ 第 1 步：手动输 IP:端口 ============
-    Write-Host ""
-    Write-Host "[1/2] 手动输入连接地址" -ForegroundColor White
-    Write-Host "  手机『无线调试』主页上那个 IP:端口（不是配对弹窗里的）" -ForegroundColor DarkGray
-    Write-Host "  不想输、想直接去配对：原样回车就行。" -ForegroundColor DarkGray
+    $cp     = $null          # 第 1 步输的连接地址；没走第 1 步（-PairOnly）时保持空
+    $cpLive = $false         # 那个端口是不是真的探通过（防止拿过期端口去误判配对端口）
 
-    $cp     = $null
-    $cpLive = $false        # 第 1 步那个端口是不是真的探通过（防止拿过期端口去误判配对端口）
-    for ($round = 1; $round -le 3; $round++) {
+    if (-not $PairOnly) {
 
-        $answer = Read-Line -Prompt '  连接 IP:端口  ' -Prefill '192.168.88.'
-        if (-not $answer -or $answer -eq '192.168.88.') { break }        # 直接去配对
-        if (-not (Test-HostPort $answer)) {
-            Write-Host "  地址不对" -ForegroundColor Yellow
-            continue
+        # ============ 第 1 步：手动输 IP:端口 ============
+        Write-Host ""
+        Write-Host "[1/2] 手动输入连接地址" -ForegroundColor White
+        Write-Host "  手机『无线调试』主页上那个 IP:端口（不是配对弹窗里的）" -ForegroundColor DarkGray
+        Write-Host "  不想输、想直接去配对：原样回车就行。" -ForegroundColor DarkGray
+
+        for ($round = 1; $round -le 3; $round++) {
+
+            $answer = Read-Line -Prompt '  连接 IP:端口  ' -Prefill '192.168.88.'
+            if (-not $answer -or $answer -eq '192.168.88.') { break }        # 直接去配对
+            if (-not (Test-HostPort $answer)) {
+                Write-Host "  地址不对" -ForegroundColor Yellow
+                continue
+            }
+
+            $cp = Parse-HostPort -Text $answer -DefaultPort '5555'
+            $portNumber = 0
+            [void][int]::TryParse($cp.Port, [ref]$portNumber)
+            $target = "$($cp.Host):$($cp.Port)"
+            Write-Host "  → 实际输入 [$target]" -ForegroundColor DarkGray
+
+            if (-not (Test-HostPortOpen -Address $cp.Host -Port $portNumber)) {
+                Write-Stamp "$target 端口没开。" Yellow
+                Write-Host "  常见原因：端口变了 / 无线调试被关了 / 手机换了 IP。" -ForegroundColor DarkGray
+                Write-Host "  回手机重看一眼那个端口，再输一次。" -ForegroundColor DarkGray
+                continue
+            }
+
+            $cpLive = $true
+            if (Try-Connect -Target $target) { return $target }
+            Write-Stamp "端口通，但 adb 没握上手（多半是没配对过，或者配对码过期了）。" Yellow
+            break
         }
 
-        $cp = Parse-HostPort -Text $answer -DefaultPort '5555'
-        $portNumber = 0
-        [void][int]::TryParse($cp.Port, [ref]$portNumber)
-        $target = "$($cp.Host):$($cp.Port)"
-        Write-Host "  → 实际输入 [$target]" -ForegroundColor DarkGray
-
-        if (-not (Test-HostPortOpen -Address $cp.Host -Port $portNumber)) {
-            Write-Stamp "$target 端口没开。" Yellow
-            Write-Host "  常见原因：端口变了 / 无线调试被关了 / 手机换了 IP。" -ForegroundColor DarkGray
-            Write-Host "  回手机重看一眼那个端口，再输一次。" -ForegroundColor DarkGray
-            continue
-        }
-
-        $cpLive = $true
-        if (Try-Connect -Target $target) { return $target }
-        Write-Stamp "端口通，但 adb 没握上手（多半是没配对过，或者配对码过期了）。" Yellow
-        break
     }
 
     # ============ 第 2 步：配对 -> 再连接 ============
     Write-Host ""
-    Write-Host "[2/2] 配对" -ForegroundColor White
+    if ($PairOnly) {
+        Write-Host "[配对] 配对（连接试了 3 次都没握上手）" -ForegroundColor White
+    } else {
+        Write-Host "[2/2] 配对" -ForegroundColor White
+    }
     Write-Host "  手机上点『使用配对码配对设备』，弹窗里有 IP:端口 和 6 位码。" -ForegroundColor DarkGray
     Write-Host "  注意：弹窗里那个是【配对端口】，跟主页的连接端口不是一回事，每次重开都会变。" -ForegroundColor Yellow
     Write-Host "  必须照着当前这个弹窗抄；抄上一次的，就会一直卡在配对。" -ForegroundColor DarkGray
@@ -1322,8 +1351,11 @@ function Reset-ScanLine {
     $script:ScanRow = -1
 }
 
-<# 一直扫，直到：扫到并连上 / adb 里有一台在线设备 / 用户按 Esc。
-   返回：设备序列号 | '__manual__'（按了 Esc）| '__menu__'（有多台在线设备） #>
+<# 一直扫，直到：扫到并连上 / adb 里有一台在线设备 / 用户按 Esc / 连了 3 次都不成。
+   返回：设备序列号
+        '__manual__'  按了 Esc，转手动输入
+        '__menu__'    adb 里有多台在线设备，出菜单
+        '__pair__'    扫到的端口是通的，但三次都没握上手 -> 直接去配对 #>
 function Wait-ForDevice {
     param([double]$IntervalSec = 2.5)
 
@@ -1347,6 +1379,7 @@ function Wait-ForDevice {
     $round   = 0
     $started = Get-Date
     $hinted  = $false
+    $connectFails = 0        # 端口通、但 adb 握不上手的次数；到 3 次直接转配对
 
     while ($true) {
 
@@ -1375,11 +1408,28 @@ function Wait-ForDevice {
                 Reset-ScanLine
                 Write-Stamp ("扫到 $($targets.Count) 个可连接地址：$($targets -join '   ')") Green
             }
-            # 先让出扫描行：成功时 Try-Connect 会打"设备已上线"，
-            # 不让出的话那行字会挤在扫描行尾巴上，看着像乱码
-            Reset-ScanLine
             foreach ($t in $targets) {
-                if (Try-Connect -Target $t -Attempts 2 -Compact) { return $t }
+                # 连接期间必须把扫描行撤掉 —— 那行还写着"扫描 mDNS 第 N 次"，
+                # 而实际上已经在 adb connect 了（最长 20 秒），看着就像扫描没停。
+                Reset-ScanLine
+                Write-Stamp "连接 $t ..." Yellow
+
+                # 这里只连 1 次：失败会回到下一轮（2.5 秒后）再试，等于自带重试，
+                # 也正好让"三次连不上"是个能数清的数。
+                if (Try-Connect -Target $t -Attempts 1 -Compact) { return $t }
+
+                if ($script:LastConnectReason -eq 'handshake' -or $script:LastConnectReason -eq 'timeout') {
+                    $connectFails++
+                    Write-Host ("    端口是通的，但没握上手（第 $connectFails/3 次）。") -ForegroundColor DarkGray
+                } else {
+                    Write-Host "    端口没开（mDNS 给的地址已经过期了），继续等下一轮。" -ForegroundColor DarkGray
+                }
+
+                if ($connectFails -ge 3) {
+                    Reset-ScanLine
+                    Write-Stamp "连了 3 次都没握上手 —— 多半是没配对过 / 配对码过期，去配对。" Yellow
+                    return '__pair__'
+                }
             }
             Show-ScanLine ("扫描 mDNS 第 $round 次（已等 ${elapsed} 秒）... 看到端口但还没连上，继续试；按 Esc 手动输入")
         }
@@ -1432,6 +1482,7 @@ function Wait-ForDevice {
      1. -Device 显式指定                -> 直接用
      2. 默认：一直扫 mDNS（2.5 秒一轮）  -> 扫到就连，连上即停
         期间按 Esc                       -> 手动输入地址 -> 连不上再配对
+        端口通但连了 3 次都不成          -> 跳过手动输入，直接去配对
         adb 里有多台在线设备             -> 方向键菜单
      3. -Setup                          -> 跳过扫描，直接进手动 / 配对 #>
 function Resolve-Device {
@@ -1466,6 +1517,7 @@ function Resolve-Device {
         $got = Wait-ForDevice
 
         if ($got -eq '__manual__') { return (Connect-NewDevice) }
+        if ($got -eq '__pair__')   { return (Connect-NewDevice -PairOnly) }
         if ($got -and $got -ne '__menu__') { return $got }
 
         # '__menu__'：adb 里有多台在线设备，落到下面出菜单
@@ -1677,14 +1729,6 @@ function Get-StatsText {
     $t = "adb-watchV  |  上滑 $script:SwipeUp   下滑 $script:SwipeDown   点按 $script:TapCount"
     if ($script:SwipeFail -gt 0) { $t += "   失败 $script:SwipeFail" }
     return $t
-}
-
-function Get-ConsoleWidth {
-    try {
-        $w = [Console]::WindowWidth
-        if ($w -gt 1) { return ($w - 1) }
-    } catch { }
-    return 79
 }
 
 <# 原地重画统计行 #>

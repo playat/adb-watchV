@@ -7,23 +7,18 @@
 .DESCRIPTION
     启动后的交互流程：
 
-      [1] 先扫一次 mDNS（只扫一次，不等待）：扫到当前端口就直接连上；
-          再跑 adb devices -l 看有没有已经连接的设备
-          · 有 -> 用上下方向键选（回车确认），最后一项是"连接新设备…"
-          · 没有 -> 直接进引导
-          · 离线 / 未授权 -> 也会列进菜单（标「离线」「未授权」），
-                    离线的那台选中就问你「要不要重新连接」，
-                    答「要」就先清死连接、再重扫 mDNS 把当前端口找回来
+      [1] 一进来就【一直扫 mDNS】，每 2.5 秒一轮，扫到就停、立刻连上。
+          连上就直接往下走，全程不用你点任何东西。
+          · 每轮也瞄一眼 adb devices：插了 USB、或上次的连接还活着，
+            立刻就用它，不用干等 mDNS。
+          · adb 里有多台在线设备时才出方向键菜单。
+          · 有离线的只在旁边提示一句，不打断扫描。
 
-          有线和无线都认：USB 序列号标 (USB)，ip:端口 标 (无线)。
-          两个同时连着也能同时列出来，选谁就把手势发给谁。
-          有线不用配对、端口也不会变，无线抽风时插根线就能接着用。
+      [2] 扫描期间按 Esc -> 转手动：输入「连接 IP:端口」。
+          输入框预填 "192.168.88."（内网基本都这样开头），接着往下敲就行。
 
-      [2] 引导（连接新设备），三连尝试，一次比一次多要信息：
-          第 1 次：mDNS 再扫一次 -> 列出 -> 选 -> connect
-          第 2 次：手动输 IP:端口 -> connect
-          第 3 次：配对 IP:端口 + 配对码 -> adb pair -> 再 connect
-          IP 输入框预填了 "192.168"（内网基本都是这个开头），接着往下敲就行。
+      [3] 手动那个地址连不上 -> 进配对：
+          配对 IP:端口 + 6 位配对码 -> adb pair -> 再连一次。
 
       [3] 连上之后才开始监听键盘：
           Alt + F1   上滑（手指从屏幕下方划到上方 -> 内容往上滚）
@@ -143,6 +138,22 @@ function Test-Interactive {
         if ([Console]::IsInputRedirected)  { return $false }
         if ([Console]::IsOutputRedirected) { return $false }
         return $true
+    } catch {
+        return $false
+    }
+}
+
+<# 只看一眼有没有按某个键（不阻塞、不等待）。
+
+   给"一边等一边能按 Esc"用：控制台里没有按键就立刻返回 $false。
+   注意它会把这个键从缓冲区取走 —— 只用在"按了就一定有动作"的键上。 #>
+function Test-KeyPressed {
+    param([ConsoleKey]$Key)
+    try {
+        if ([Console]::IsInputRedirected) { return $false }
+        if (-not [Console]::KeyAvailable) { return $false }
+        $k = [Console]::ReadKey($true)
+        return ($k.Key -eq $Key)
     } catch {
         return $false
     }
@@ -917,7 +928,8 @@ function Try-Connect {
     [void][int]::TryParse($hp.Port, [ref]$portNumber)
 
     if (-not (Test-HostPortOpen -Address $hp.Host -Port $portNumber)) {
-        Write-Stamp "$Target 端口没开（没监听 / 端口已经变了）" Yellow
+        # Compact 是扫描循环在调：每 2.5 秒报一次会刷屏，交给调用方统一说
+        if (-not $Compact) { Write-Stamp "$Target 端口没开（没监听 / 端口已经变了）" Yellow }
         return $false
     }
 
@@ -929,7 +941,7 @@ function Try-Connect {
             Write-Stamp "第 $i 次重试连接 $Target ..." DarkGray
             Start-Sleep -Milliseconds 1200
         } elseif ($Compact) {
-            Write-Stamp "连接 $Target ..." DarkGray
+            # 扫描循环里静默，别每轮刷一行
         } else {
             Write-Stamp "连接：adb connect $Target" Yellow
         }
@@ -999,57 +1011,22 @@ function Connect-NewDevice {
 
     # 已知的【连接端口】。后面配对时要拿它做反查：
     # 如果用户把连接端口填进了配对输入框，必须当场拦下来，否则 adb pair 会一直卡着。
+    # 来源是前面扫描阶段见过的地址（$script:KnownConnectAddrs）。
     $knownConnect = New-Object System.Collections.Generic.List[string]
+    foreach ($a in @($script:KnownConnectAddrs)) { $knownConnect.Add($a) }
 
-    # ============ 第 1 次尝试：mDNS 自动发现 ============
+    # ============ 第 1 步：手动输 IP:端口 ============
     Write-Host ""
-    Write-Host "[1/3] mDNS 扫一次 ..." -ForegroundColor White
-    $mdns        = @(Get-MdnsServices)
-    $connectOnes = @($mdns | Where-Object { $_.Service -eq 'connect' })
-
-    if ($connectOnes.Count -gt 0) {
-
-        $items  = New-Object System.Collections.Generic.List[string]
-        $values = New-Object System.Collections.Generic.List[string]
-
-        foreach ($d in $connectOnes) {
-            $addr = "$($d.Host):$($d.Port)"
-            if ($values.Contains($addr)) { continue }        # 同一条服务可能重复广播
-            $items.Add($addr.PadRight(24) + '连接')
-            $values.Add($addr)
-            if (-not $knownConnect.Contains($addr)) { $knownConnect.Add($addr) }
-        }
-
-        Write-Host "  发现 $($values.Count) 个可连接地址：" -ForegroundColor DarkGray
-        $idx = Read-MenuChoice -Items $items.ToArray()
-
-        if ($idx -ge 0) {
-            $target = $values[$idx]
-            if (Try-Connect -Target $target) { return $target }
-            Write-Stamp "第 1 次尝试失败，继续。" Yellow
-        } else {
-            Write-Host "  跳过 mDNS，改手动输入。" -ForegroundColor DarkGray
-        }
-
-    } elseif ($mdns.Count -gt 0) {
-        Write-Stamp "只扫到配对端口，没有可连接的端口。" Yellow
-        Write-Host "  配对端口不能用来连接；回手机看『无线调试』主页那个 IP:端口。" -ForegroundColor DarkGray
-    } else {
-        Write-Stamp "mDNS 没发现设备（手机和电脑可能不在同一网段，或者路由器挡了组播）。" Yellow
-    }
-
-    # ============ 第 2 次尝试：手动输 IP:端口 ============
-    Write-Host ""
-    Write-Host "[2/3] 手动输入连接地址" -ForegroundColor White
+    Write-Host "[1/2] 手动输入连接地址" -ForegroundColor White
     Write-Host "  手机『无线调试』主页上那个 IP:端口（不是配对弹窗里的）" -ForegroundColor DarkGray
     Write-Host "  不想输、想直接去配对：原样回车就行。" -ForegroundColor DarkGray
 
     $cp     = $null
-    $cpLive = $false        # 第 2 步那个端口是不是真的探通过（防止拿过期端口去误判配对端口）
+    $cpLive = $false        # 第 1 步那个端口是不是真的探通过（防止拿过期端口去误判配对端口）
     for ($round = 1; $round -le 3; $round++) {
 
-        $answer = Read-Line -Prompt '  连接 IP:端口  ' -Prefill '192.168'
-        if (-not $answer -or $answer -eq '192.168') { break }        # 直接去配对
+        $answer = Read-Line -Prompt '  连接 IP:端口  ' -Prefill '192.168.88.'
+        if (-not $answer -or $answer -eq '192.168.88.') { break }        # 直接去配对
         if (-not (Test-HostPort $answer)) {
             Write-Host "  地址不对" -ForegroundColor Yellow
             continue
@@ -1074,9 +1051,9 @@ function Connect-NewDevice {
         break
     }
 
-    # ============ 第 3 次尝试：配对 -> 再连接 ============
+    # ============ 第 2 步：配对 -> 再连接 ============
     Write-Host ""
-    Write-Host "[3/3] 配对" -ForegroundColor White
+    Write-Host "[2/2] 配对" -ForegroundColor White
     Write-Host "  手机上点『使用配对码配对设备』，弹窗里有 IP:端口 和 6 位码。" -ForegroundColor DarkGray
     Write-Host "  注意：弹窗里那个是【配对端口】，跟主页的连接端口不是一回事，每次重开都会变。" -ForegroundColor Yellow
     Write-Host "  必须照着当前这个弹窗抄；抄上一次的，就会一直卡在配对。" -ForegroundColor DarkGray
@@ -1088,8 +1065,8 @@ function Connect-NewDevice {
 
         $pairAnswer = ''
         while ($true) {
-            $pairAnswer = Read-Line -Prompt '  配对 IP:端口  ' -Prefill '192.168'
-            if ($pairAnswer -and $pairAnswer -ne '192.168' -and (Test-HostPort $pairAnswer)) { break }
+            $pairAnswer = Read-Line -Prompt '  配对 IP:端口  ' -Prefill '192.168.88.'
+            if ($pairAnswer -and $pairAnswer -ne '192.168.88.' -and (Test-HostPort $pairAnswer)) { break }
             Write-Host "  地址不对" -ForegroundColor Yellow
         }
 
@@ -1177,7 +1154,7 @@ function Connect-NewDevice {
     }
 
     Write-Host ""
-    Write-Host "三次都失败。按这个顺序排查：" -ForegroundColor Red
+    Write-Host "两步都没成。按这个顺序排查：" -ForegroundColor Red
     Write-Host "  1. 手机和电脑是不是同一个 Wi-Fi？（访客网络 / AP 隔离会直接不通）" -ForegroundColor DarkGray
     Write-Host "  2. 手机『无线调试』还开着吗？主页的 IP:端口 和配对弹窗的端口不是一回事。" -ForegroundColor DarkGray
     Write-Host "  3. 手机 IP 变了吗？（重连 Wi-Fi 常被 DHCP 换掉，以手机屏幕上显示的为准）" -ForegroundColor DarkGray
@@ -1298,12 +1275,165 @@ function Repair-Device {
 }
 
 
+
+# ---------------------------------------------------------------- 扫描等待
+<# 启动就干等 mDNS：每 2.5 秒扫一次，扫到就停、立刻连。
+
+   为什么改成"一直扫"：手机重开无线调试之后，mDNS 广播要过几秒才出来，
+   adb 自己的 mDNS 缓存有时还是旧的。以前只扫一次，扫不到就把人推进手动流程，
+   结果就是每次开机都得自己抄一遍端口。现在扫到就自动连，不用管。
+
+   等待期间按 Esc -> 返回 __manual__，转手动输入。
+   同时每轮也瞄一眼 adb devices：插了 USB、或者上次的连接还活着，立刻就用。 #>
+$script:ScanRow = -1
+# 扫到过的连接地址：配对时要拿它反查，防止把连接端口填进配对框
+$script:KnownConnectAddrs = New-Object System.Collections.Generic.List[string]
+
+$script:ScanLastSet = ''        # 上一轮扫到的地址集合，用来去重（只在变化时打印）
+<# 扫描进度行：原地重画，别每 2.5 秒刷一行 #>
+function Show-ScanLine {
+    param([string]$Text)
+    $line = $Text.PadRight((Get-ConsoleWidth))
+    try {
+        if ($script:ScanRow -lt 0) {
+            if ([Console]::CursorLeft -ne 0) { [Console]::WriteLine() }
+            $row = [Console]::CursorTop
+            [Console]::Write($line)
+            $script:ScanRow = $row
+        } else {
+            $saved = [Console]::CursorTop
+            [Console]::SetCursorPosition(0, $script:ScanRow)
+            [Console]::Write($line)
+            [Console]::SetCursorPosition(0, $saved)
+        }
+    } catch {
+        Write-Host $Text -ForegroundColor DarkGray
+    }
+}
+
+<# 让出扫描行：擦干净，光标停在行首，后面的正常输出从这里开始 #>
+function Reset-ScanLine {
+    if ($script:ScanRow -lt 0) { return }
+    try {
+        [Console]::SetCursorPosition(0, $script:ScanRow)
+        [Console]::Write((' ' * (Get-ConsoleWidth)))
+        [Console]::SetCursorPosition(0, $script:ScanRow)
+    } catch { }
+    $script:ScanRow = -1
+}
+
+<# 一直扫，直到：扫到并连上 / adb 里有一台在线设备 / 用户按 Esc。
+   返回：设备序列号 | '__manual__'（按了 Esc）| '__menu__'（有多台在线设备） #>
+function Wait-ForDevice {
+    param([double]$IntervalSec = 2.5)
+
+    # 兜底：这个清单正常由上面的初始化语句建好；万一被单独 dot-source 也不会炸
+    if (-not $script:KnownConnectAddrs) {
+        $script:KnownConnectAddrs = New-Object System.Collections.Generic.List[string]
+    }
+
+    # 管道 / 重定向：没法人机交互，扫一次，扫到就用
+    if (-not (Test-Interactive)) {
+        foreach ($t in @(Get-MdnsConnectTargets)) {
+            if (Try-Connect -Target $t -Attempts 2 -Compact) { return $t }
+        }
+        return ''
+    }
+
+    # 开扫之前先清一遍 adb 服务：里面可能留着上次的死连接和旧 mDNS 记录，
+    # 不清就会一直扫到那个已经死掉的端口，白转半天。
+    Restart-AdbServer | Out-Null
+
+    $round   = 0
+    $started = Get-Date
+    $hinted  = $false
+
+    while ($true) {
+
+        # Esc 先看一眼：别让人等了半天、按了却没反应
+        if (Test-KeyPressed -Key ([ConsoleKey]::Escape)) {
+            Reset-ScanLine
+            Write-Stamp "按了 Esc，转手动输入。" Yellow
+            return '__manual__'
+        }
+
+        $round++
+        $elapsed   = [int]((Get-Date) - $started).TotalSeconds
+        $roundStart = Get-Date
+        Show-ScanLine ("扫描 mDNS 第 $round 次（已等 ${elapsed} 秒，2.5 秒一轮）... 按 Esc 手动输入")
+
+        # ---- 1) mDNS：扫到就试连，连上立刻返回 ----
+        $targets = @(Get-MdnsConnectTargets)
+        foreach ($t in $targets) {
+            if (-not $script:KnownConnectAddrs.Contains($t)) { $script:KnownConnectAddrs.Add($t) }
+        }
+        if ($targets.Count -gt 0) {
+            # 只在地址集合变化时打印一次，别每轮都喊
+            $key = ($targets -join ',')
+            if ($key -ne $script:ScanLastSet) {
+                $script:ScanLastSet = $key
+                Reset-ScanLine
+                Write-Stamp ("扫到 $($targets.Count) 个可连接地址：$($targets -join '   ')") Green
+            }
+            # 先让出扫描行：成功时 Try-Connect 会打"设备已上线"，
+            # 不让出的话那行字会挤在扫描行尾巴上，看着像乱码
+            Reset-ScanLine
+            foreach ($t in $targets) {
+                if (Try-Connect -Target $t -Attempts 2 -Compact) { return $t }
+            }
+            Show-ScanLine ("扫描 mDNS 第 $round 次（已等 ${elapsed} 秒）... 看到端口但还没连上，继续试；按 Esc 手动输入")
+        }
+
+        # ---- 2) 顺手看 adb：插了 USB、或上次的连接还在，都不用等 mDNS ----
+        $all     = @(Get-DeviceList)
+        $online  = @($all | Where-Object { $_.State -eq 'device' })
+        $pending = @($all | Where-Object { $_.State -ne 'device' })
+
+        if ($online.Count -eq 1) {
+            Reset-ScanLine
+            Write-Stamp "adb 里已经有一台在线设备：$($online[0].Serial)  ($(Get-LinkKind $online[0].Serial))" Green
+            return $online[0].Serial
+        }
+        if ($online.Count -gt 1) {
+            Reset-ScanLine
+            return '__menu__'
+        }
+
+        # ---- 3) 有离线的：说一次就够了，不打断扫描 ----
+        if (-not $hinted -and $pending.Count -gt 0) {
+            $hinted = $true
+            Reset-ScanLine
+            foreach ($d in $pending) {
+                Write-Stamp "adb 里有一台「$(Get-StateText $d.State)」：$($d.Serial)  ($(Get-LinkKind $d.Serial))" Yellow
+            }
+            Write-Host "  它多半只是端口变了 —— 接着等 mDNS 自己扫到；不想等就按 Esc 手动输入。" -ForegroundColor DarkGray
+            Show-ScanLine ("扫描 mDNS 第 $round 次（已等 ${elapsed} 秒，2.5 秒一轮）... 按 Esc 手动输入")
+        }
+
+        # ---- 4) 补足 2.5 秒的间隔：扫描本身要花几百毫秒到两秒 ----
+        $spent = ((Get-Date) - $roundStart).TotalMilliseconds
+        $rest  = [int]($IntervalSec * 1000 - $spent)
+        if ($rest -gt 0) {
+            $end = (Get-Date).AddMilliseconds($rest)
+            while ((Get-Date) -lt $end) {
+                if (Test-KeyPressed -Key ([ConsoleKey]::Escape)) {
+                    Reset-ScanLine
+                    Write-Stamp "按了 Esc，转手动输入。" Yellow
+                    return '__manual__'
+                }
+                Start-Sleep -Milliseconds 100
+            }
+        }
+    }
+}
+
 # ---------------------------------------------------------------- 设备主流程
 <# 优先级：
-     1. -Device 显式指定               -> 直接用
-     2. adb 里已有设备                 -> 方向键菜单选（含"连接新设备…"）
-        没有设备 / 选了"连接新设备…"  -> 进配对引导
-     3. -Setup                         -> 直接进配对引导 #>
+     1. -Device 显式指定                -> 直接用
+     2. 默认：一直扫 mDNS（2.5 秒一轮）  -> 扫到就连，连上即停
+        期间按 Esc                       -> 手动输入地址 -> 连不上再配对
+        adb 里有多台在线设备             -> 方向键菜单
+     3. -Setup                          -> 跳过扫描，直接进手动 / 配对 #>
 function Resolve-Device {
     param(
         [string]$Explicit,
@@ -1331,19 +1461,14 @@ function Resolve-Device {
 
     if (-not $ForceSetup) {
 
-        # 每次启动先扫一次 mDNS：手机重开无线调试后连接端口会变，
-        # 扫到就直接用当前端口连上；扫不到就往下走正常流程。
-        Write-Stamp "扫一下 mDNS ..." DarkGray
-        $discovered = @(Get-MdnsConnectTargets)
-        if ($discovered.Count -gt 0) {
-            foreach ($t in $discovered) {
-                if (Try-Connect -Target $t -Attempts 2 -Compact) { break }
-            }
-        } else {
-            Write-Stamp "没扫到（不代表连不上，接着看 adb 里有没有现成的）。" DarkGray
-        }
+        # 一进来就死等 mDNS：每 2.5 秒扫一轮，扫到立刻连上，连上即停。
+        # 不想等就按 Esc -> 手动输入（预填 192.168.88.），连不上再走配对。
+        $got = Wait-ForDevice
 
-        Write-Stamp "正在查看 adb 里已连接的设备 ..." DarkGray
+        if ($got -eq '__manual__') { return (Connect-NewDevice) }
+        if ($got -and $got -ne '__menu__') { return $got }
+
+        # '__menu__'：adb 里有多台在线设备，落到下面出菜单
         $all     = @(Get-DeviceList)
         $online  = @($all | Where-Object { $_.State -eq 'device' })
         $pending = @($all | Where-Object { $_.State -ne 'device' })
@@ -1615,8 +1740,8 @@ function Show-OfflineHint {
 
     $script:OfflineWarned = $true
     Write-Stamp "设备已经离线（$Device），手势现在发不出去。" Yellow
-    Write-Host "  关掉窗口重跑脚本，菜单里选中它就会问你要不要重新连接。" -ForegroundColor DarkGray
-    Write-Host "  或者插上 USB 线继续按快捷键（有线掉线概率低得多）。" -ForegroundColor DarkGray
+    Write-Host "  按 Esc 可以手动输入当前端口重连（手机『无线调试』主页上那个）。" -ForegroundColor DarkGray
+    Write-Host "  不想折腾就插 USB 线，有线掉线概率低得多。" -ForegroundColor DarkGray
 }
 
 <# 一次滑动。

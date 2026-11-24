@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""双击启动（无控制台）。等价于 start-watchV.cmd。"""
+"""双击启动（无控制台）。等价于 run.cmd。"""
 
 import os
 import sys

@@ -90,8 +90,9 @@ BAR_BG = "#232529"
 BAR_HOVER = "#34373d"
 BAR_GRIP = "#2c2f34"
 
-BAR_ALPHA = 0.78            # 平时半透明：压在最上层也不挡视线
+BAR_ALPHA = 0.10            # 平时 10% 不透明：几乎只剩个影子，压在最上层也不挡
 BAR_ALPHA_HOVER = 0.98      # 鼠标移上去变清晰，方便点准
+BAR_ALPHA_MSG = 0.92        # 有提示文字时临时提亮，否则 10% 下根本读不出来
 
 # 全局热键：沿用老版定下来的 Alt+F1/F2/F3，左手一只，右手不用离鼠标。
 # 想换键改这里就行，支持 F1~F24、单个字母/数字，修饰键写 Ctrl / Alt / Shift / Win。
@@ -462,6 +463,8 @@ class Bar:
         self.win.configure(bg=BORDER)
         self._hover_job = None
         self._flash_seq = 0
+        self._hovering = False
+        self._alert = False
 
         self.inner = tk.Frame(self.win, bg=BAR_BG)
         self.inner.pack(padx=px(1), pady=px(1))
@@ -516,7 +519,7 @@ class Bar:
         """默认贴主屏左上角。"""
         self.win.update_idletasks()
         self.win.geometry("+%d+%d" % (px(24), px(24)))
-        self._set_alpha(BAR_ALPHA)   # overrideredirect 窗口要在 map 之后设一次才稳
+        self._refresh_alpha()        # overrideredirect 窗口要在 map 之后设一次才稳
         self.win.lift()
 
     def _drag_start(self, event):
@@ -538,11 +541,13 @@ class Bar:
 
     def _on_enter(self, _event=None):
         self._cancel_hover()
-        self._set_alpha(BAR_ALPHA_HOVER)
+        self._hovering = True
+        self._refresh_alpha()
 
     def _on_leave(self, _event=None):
         # 从 ▲ 移到 ● 会先收到 Leave 再收到 Enter，所以晚一点再决定，避免闪烁
         self._cancel_hover()
+        self._hovering = False
         try:
             self._hover_job = self.win.after(150, self._fade_out)
         except tk.TclError:
@@ -550,7 +555,7 @@ class Bar:
 
     def _fade_out(self):
         self._hover_job = None
-        self._set_alpha(BAR_ALPHA)
+        self._refresh_alpha()
 
     def _cancel_hover(self):
         if self._hover_job is not None:
@@ -566,21 +571,37 @@ class Bar:
         except tk.TclError:
             pass
 
+    def _refresh_alpha(self):
+        """三条路：鼠标在上面 > 有提示文字 > 平时。10% 下文字读不出来，所以提示时提亮。"""
+        if self._hovering:
+            value = BAR_ALPHA_HOVER
+        elif self._alert:
+            value = BAR_ALPHA_MSG
+        else:
+            value = BAR_ALPHA
+        self._set_alpha(value)
+
     # ---- 状态 ----
 
     def note(self, text):
         self._flash_seq += 1        # 常驻提示一出现，就别让 flash 的定时器再清它
         self.msg.configure(text=text, fg=ERR)
+        self._alert = bool(text)
+        self._refresh_alpha()
 
     def flash(self, text, ms=4000):
         """临时提示，几秒后自己消失。"""
         self._flash_seq += 1
         seq = self._flash_seq
         self.msg.configure(text=text, fg=WARN)
+        self._alert = True
+        self._refresh_alpha()
 
         def clear():
             if seq == self._flash_seq and self.msg.cget("text") == text:
                 self.msg.configure(text="")
+                self._alert = False
+                self._refresh_alpha()
 
         try:
             self.win.after(ms, clear)
@@ -589,6 +610,8 @@ class Bar:
 
     def clear_note(self):
         self.msg.configure(text="")
+        self._alert = False
+        self._refresh_alpha()
 
     def _menu(self, event):
         m = tk.Menu(self.win, tearoff=0)

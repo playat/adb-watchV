@@ -125,6 +125,8 @@ VK_EXTRA = {
 }
 
 WIN_W = px(430)
+MSG_MAX_H = px(190)       # 文本区最多这么高，再长就滚动
+MSG_MIN_H = px(58)        # 太短会显得窗口在抖
 DURATION_MS = 300
 NEAR_RATIO = 0.8
 FAR_RATIO = 0.2
@@ -152,6 +154,25 @@ def decode(raw):
         except Exception:
             continue
     return raw.decode("utf-8", "replace")
+
+
+def work_area():
+    """桌面可用区域 (left, top, right, bottom)，扣掉任务栏；拿不到就给整块屏幕。"""
+    class RECT(ctypes.Structure):
+        _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                    ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+    if os.name == "nt":
+        try:
+            r = RECT()
+            # SPI_GETWORKAREA = 0x0030
+            if ctypes.windll.user32.SystemParametersInfoW(
+                    0x0030, 0, ctypes.byref(r), 0):
+                if r.right > r.left and r.bottom > r.top:
+                    return r.left, r.top, r.right, r.bottom
+        except Exception:
+            pass
+    return None
 
 
 def parse_hostport(text, default_port=5555):
@@ -660,6 +681,9 @@ class App:
         self.ui_queue = queue.Queue()
         self.gesture_lock = threading.Lock()
         self.busy = False
+        self._bar_shown = False    # 文本区滚动条当前是不是露着
+        self._sync_guard = False
+        self._pos = None           # 窗口左上角；None 表示还没摆过（首次居中）
         self.hotkeys = HotKeys(self)
 
         self._build()
@@ -679,48 +703,151 @@ class App:
         self.dot = tk.Label(head, text="●", bg=BG, fg=MUTED, font=(FONT, 9))
         self.dot.pack(side="right")
 
-        self.lbl_status = tk.Label(wrap, text="准备中…", bg=BG, fg=FG,
+        # 输入模块先占住底部，文本再长也压不到它
+        self.body = tk.Frame(wrap, bg=BG)
+        self.body.pack(side="bottom", fill="x", pady=(px(12), 0))
+
+        # 中间的文本区：超过 MSG_MAX_H 就在自己内部滚动，不撑窗口
+        self.msg_box = tk.Frame(wrap, bg=BG)
+        self.msg_box.pack(fill="both", expand=True, pady=(px(8), 0))
+
+        self.msg_canvas = tk.Canvas(self.msg_box, bg=BG, bd=0,
+                                    highlightthickness=0, height=px(MSG_MIN_H))
+        self.msg_bar = tk.Scrollbar(self.msg_box, orient="vertical",
+                                    command=self.msg_canvas.yview,
+                                    width=px(8), bg=BG, troughcolor=BG,
+                                    activebackground=BORDER, relief="flat", bd=0)
+        self.msg_canvas.configure(yscrollcommand=self._scroll_set)
+        self.msg_canvas.pack(side="left", fill="both", expand=True)
+
+        self.msg_inner = tk.Frame(self.msg_canvas, bg=BG)
+        self._msg_win = self.msg_canvas.create_window(
+            (0, 0), window=self.msg_inner, anchor="nw")
+        self.msg_canvas.bind("<Configure>", self._msg_wide)
+
+        self.lbl_status = tk.Label(self.msg_inner, text="准备中…", bg=BG, fg=FG,
                                    font=(FONT, 10), anchor="w", justify="left",
                                    wraplength=WIN_W - px(40))
-        self.lbl_status.pack(fill="x", pady=(px(10), px(2)))
+        self.lbl_status.pack(fill="x", pady=(0, px(2)))
 
-        self.lbl_detail = tk.Label(wrap, text="", bg=BG, fg=MUTED,
+        self.lbl_detail = tk.Label(self.msg_inner, text="", bg=BG, fg=MUTED,
                                    font=(FONT, 9), anchor="w", justify="left",
                                    wraplength=WIN_W - px(40))
         self.lbl_detail.pack(fill="x")
 
-        self.lbl_error = tk.Label(wrap, text="", bg=BG, fg=ERR,
+        self.lbl_error = tk.Label(self.msg_inner, text="", bg=BG, fg=ERR,
                                   font=(FONT, 9), anchor="w", justify="left",
                                   wraplength=WIN_W - px(40))
         self.lbl_error.pack(fill="x")
 
-        self.body = tk.Frame(wrap, bg=BG)
-        self.body.pack(fill="x", pady=(px(12), 0))
+        self._wheel_bind(self.msg_inner)
 
-        self.center(px(150))
-        self.root.attributes("-topmost", True)
+        self.root.bind("<Configure>", self._on_move, add="+")
+        self.place(px(150))
         self.root.bind("<Escape>", self.on_escape)
 
     def fit(self):
         self.root.update_idletasks()
         h = self.root.winfo_reqheight()
-        self.center(max(h, px(130)))
+        self.place(max(h, px(130)))
 
-    def center(self, height):
-        """主窗口摆到屏幕正中：水平、垂直都居中。"""
+    # ---- 文本区：超高了就滚动 ----
+
+    def _scroll_set(self, first, last):
+        self.msg_bar.set(first, last)
+
+    def _msg_wide(self, event):
+        """内层 Frame 跟着 canvas 的宽度走，否则文字会按最宽那行排版。"""
+        self.msg_canvas.itemconfigure(self._msg_win, width=max(event.width, 1))
+
+    def _wheel(self, event):
+        if not self._bar_shown:
+            return
+        self.msg_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+
+    def _wheel_bind(self, widget):
+        widget.bind("<MouseWheel>", self._wheel, add="+")
+        for child in widget.winfo_children():
+            self._wheel_bind(child)
+
+    def _sync_msg(self):
+        """按文本实际高度调整滚动区：不超过上限就原样显示，超了就出滚动条。"""
+        if self._sync_guard:
+            return
+        self._sync_guard = True
+        try:
+            self.msg_inner.update_idletasks()
+            h = self.msg_inner.winfo_reqheight()
+            maxh = MSG_MAX_H
+            show = h > maxh
+            if show != self._bar_shown:
+                self._bar_shown = show
+                if show:
+                    self.msg_bar.pack(side="right", fill="y")
+                    # 有滚动条了，文字宽度要缩一点，重新量一次
+                    wrap_w = WIN_W - px(40) - px(10)
+                    for lbl in (self.lbl_status, self.lbl_detail, self.lbl_error):
+                        lbl.configure(wraplength=wrap_w)
+                else:
+                    self.msg_bar.pack_forget()
+                    wrap_w = WIN_W - px(40)
+                    for lbl in (self.lbl_status, self.lbl_detail, self.lbl_error):
+                        lbl.configure(wraplength=wrap_w)
+                self.msg_inner.update_idletasks()
+                h = self.msg_inner.winfo_reqheight()
+            height = max(MSG_MIN_H, min(h, maxh))
+            self.msg_canvas.configure(height=height)
+            self.msg_canvas.configure(
+                scrollregion=(0, 0, max(self.msg_inner.winfo_reqwidth(), 1), h))
+            if show:
+                self.msg_canvas.yview_moveto(1.0)   # 最新那行在下面，滚到底
+        finally:
+            self._sync_guard = False
+        self.fit()
+
+    def place(self, height):
+        """摆窗口：第一次放屏幕正中，之后只改高度，位置跟着窗口走。
+
+        以前每次刷新都重算居中，用户把窗口拖到别处、一刷新又弹回中间，很难受。
+        现在位置记住在 _pos 里（用户拖动时由 _on_move 更新），只做防出屏的夹取。
+        """
         w = WIN_W
-        x = (self.root.winfo_screenwidth() - w) // 2
-        y = (self.root.winfo_screenheight() - height) // 2
+        area = work_area() or (0, 0, self.root.winfo_screenwidth(),
+                               self.root.winfo_screenheight())
+        left, top, right, bottom = area
+        if self._pos is None:
+            x = left + (right - left - w) // 2
+            y = top + (bottom - top - height) // 2
+        else:
+            x, y = self._pos
+            x = max(left, min(x, right - w))
+            y = max(top, min(y, bottom - height))   # 变高之后别被任务栏吃掉
+        self._pos = (x, y)
         self.root.geometry("%dx%d+%d+%d" % (w, height, x, y))
+
+    def _on_move(self, event):
+        """窗口被拖到别处时记住位置，下次变高就按这个位置长。"""
+        if event.widget is not self.root:
+            return
+        try:
+            if self.root.state() != "normal":
+                return
+            pos = (self.root.winfo_x(), self.root.winfo_y())
+        except tk.TclError:
+            return
+        if pos != self._pos:
+            self._pos = pos
 
     # ---- 文案 ----
 
     def say(self, status, detail="", color=FG):
         self.lbl_status.configure(text=status, fg=color)
         self.lbl_detail.configure(text=detail)
+        self._sync_msg()
 
     def error(self, text=""):
         self.lbl_error.configure(text=text)
+        self._sync_msg()
 
     def dot_color(self, color):
         self.dot.configure(fg=color)
@@ -923,14 +1050,18 @@ class App:
         e.icursor("end")
         return e
 
-    def _ok(self, parent, command, text="✓"):
+    def _ok(self, parent, command, text="✓", color=ACCENT):
         b = tk.Button(parent, text=text, command=command, font=(SYMBOL_FONT, 12),
-                      bg=BTN_BG, fg=ACCENT, activebackground=BTN_HOVER,
-                      activeforeground=ACCENT, relief="flat", bd=0,
+                      bg=BTN_BG, fg=color, activebackground=BTN_HOVER,
+                      activeforeground=color, relief="flat", bd=0,
                       highlightthickness=0, width=3, cursor="hand2")
         b.bind("<Enter>", lambda e: b.configure(bg=BTN_HOVER))
         b.bind("<Leave>", lambda e: b.configure(bg=BTN_BG))
         return b
+
+    def _scan_btn(self, parent):
+        """⟳ —— 回到扫描模式。收起的图标按钮，跟 ✓ 排一起。"""
+        return self._ok(parent, self.start_scan, "⟳", color=MUTED)
 
     def on_escape(self, _event=None):
         """Esc 只在扫描阶段有意义：停下扫描，长出输入模块。"""
@@ -946,7 +1077,7 @@ class App:
         self.state = "manual"
         self.clear_body()
         self.error("")
-        self.say("手动连接", "手机『无线调试』主页上的 IP:端口。填完点 ✓ 或按回车。")
+        self.say("手动连接", "手机『无线调试』主页上的 IP:端口。填完点 ✓ 或回车；点 ⟳ 回去继续扫描。")
         self.dot_color(WARN)
 
         f = tk.Frame(self.body, bg=BG)
@@ -955,10 +1086,11 @@ class App:
 
         tk.Label(f, text="连接 IP:端口", bg=BG, fg=MUTED,
                  font=(FONT, 9)).grid(row=0, column=0, sticky="w")
-        self.ip_entry = self._entry(f, "192.168.88.")
+        self.ip_entry = self._entry(f, "192.168.88.", 15)
         self.ip_entry.grid(row=0, column=1, sticky="we", padx=(px(10), px(8)))
         self.ok_btn = self._ok(f, self.do_manual)
         self.ok_btn.grid(row=0, column=2, sticky="ns")
+        self._scan_btn(f).grid(row=0, column=3, sticky="ns", padx=(px(6), 0))
 
         self.ip_entry.bind("<Return>", lambda e: self.do_manual())
         self.ip_entry.focus_set()
@@ -1028,16 +1160,18 @@ class App:
 
         tk.Label(f, text="配对 IP:端口", bg=BG, fg=MUTED,
                  font=(FONT, 9)).grid(row=0, column=0, sticky="w", pady=px(2))
-        self.ip_entry = self._entry(f, (hint_host + ":") if hint_host else "192.168.88.", 17)
+        self.ip_entry = self._entry(f, (hint_host + ":") if hint_host else "192.168.88.", 15)
         self.ip_entry.grid(row=0, column=1, sticky="we", padx=(px(10), px(8)), pady=px(2))
 
         tk.Label(f, text="配对码", bg=BG, fg=MUTED,
                  font=(FONT, 9)).grid(row=1, column=0, sticky="w", pady=px(2))
-        self.code_entry = self._entry(f, "", 17)
+        self.code_entry = self._entry(f, "", 15)
         self.code_entry.grid(row=1, column=1, sticky="we", padx=(px(10), px(8)), pady=px(2))
 
         self.ok_btn = self._ok(f, self.do_pair, "✓")
         self.ok_btn.grid(row=0, column=2, rowspan=2, sticky="ns")
+        self._scan_btn(f).grid(row=0, column=3, rowspan=2, sticky="ns",
+                               padx=(px(6), 0))
 
         back = tk.Label(f, text="← 返回手动连接", bg=BG, fg=MUTED,
                         font=(FONT, 8), cursor="hand2")
@@ -1224,7 +1358,6 @@ class App:
         self.notes.clear()
         try:
             self.root.deiconify()
-            self.root.attributes("-topmost", True)
             self.root.lift()
         except tk.TclError:
             return

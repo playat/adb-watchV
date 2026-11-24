@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
-"""双击启动（无控制台）。等价于 run.cmd。"""
+"""双击启动（无控制台）。
+
+.pyw 由 pythonw 执行，不会创建控制台窗口；本文件只负责把自身目录加进
+sys.path，然后调用 adb_watch_v.main()。
+"""
 
 import os
 import sys
